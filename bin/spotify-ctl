@@ -1,0 +1,27 @@
+#!/bin/bash
+# Spotify control for tmux key bindings: spotify-ctl playpause|next|prev
+# Never launches Spotify; flashes the resulting track in the tmux message line.
+case "$1" in
+    playpause) cmd="playpause" ;;
+    next)      cmd="next track" ;;
+    prev)      cmd="previous track" ;;
+    *) echo "usage: spotify-ctl playpause|next|prev" >&2; exit 2 ;;
+esac
+msg=$(osascript <<EOF
+if application "Spotify" is running then
+  tell application "Spotify"
+    $cmd
+    delay 0.4
+    if player state is playing then
+      return "▶ " & (name of current track) & " — " & (artist of current track)
+    else
+      return "⏸ " & (name of current track) & " — " & (artist of current track)
+    end if
+  end tell
+else
+  return "Spotify is not open"
+end if
+EOF
+)
+[ -n "$TMUX" ] && tmux display-message -d 2500 "♫ $msg"
+exit 0

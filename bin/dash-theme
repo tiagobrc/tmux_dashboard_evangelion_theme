@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Switch tmux + btop + iTerm + VS Code between the MAGI theme variants and the original look.
+
+    dash-theme magi | eva01 | eva02      apply a variant (https://github.com/SinsuSquid/MAGI-theme)
+    dash-theme default                   back to how things were
+    dash-theme status                    what is active
+    dash-theme paint                     re-send the active palette to the terminals showing tmux
+    dash-theme style                     (re)apply the orange dash-window styling to every dash window
+
+Nothing is overwritten without a copy: the first run saves ~/.tmux.conf, btop.conf, VS Code's
+settings.json and the iTerm preferences to ~/.local/share/dash-theme/backup-<timestamp>/.
+tmux: our own theme built from the variant's palette (the repo's tmux file would replace the
+window slogans with plain names). iTerm: generated dynamic profiles that inherit the Default
+profile's font, and the palette is sent live to every terminal attached to tmux (SetColors escape),
+so an iTerm that is SSH'd in from another Mac is themed too. New iTerm windows outside tmux are painted by a
+small block at the top of ~/.zshrc that cats ~/.local/share/dash-theme/paint.esc. The Default profile itself is never edited.
+"""
+import json, os, plistlib, re, shutil, subprocess, sys, time, tomllib
+from pathlib import Path
+
+HOME = Path.home()
+BASE = HOME / ".local" / "share" / "dash-theme"
+REPO = BASE / "MAGI-theme"
+STATE = BASE / "active"
+TMUX_THEME = HOME / ".tmux" / "theme.conf"
+TMUX_CONF = HOME / ".tmux.conf"
+BTOP_DIR = HOME / ".config" / "btop"
+ITERM_DYNAMIC = HOME / "Library" / "Application Support" / "iTerm2" / "DynamicProfiles" / "magi-theme.json"
+ITERM_PREFS = HOME / "Library" / "Preferences" / "com.googlecode.iterm2.plist"
+VSCODE_SETTINGS = HOME / "Library" / "Application Support" / "Code" / "User" / "settings.json"
+CODE = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+VARIANTS = {"magi": ("MAGI", "MAGI"), "eva01": ("EVA-01", "EVA-01"), "eva02": ("EVA-02", "EVA-02")}  # badge, VS Code label
+SLOGAN = "#{?#{==:#{pane_title},#{host}},#W,#{pane_title}}"
+# Orange-only treatment of the dashboard (tmux borders + the widgets' default text), per variant. Without an entry the
+# variant keeps its plain look. border = every pane edge, active = the selected pane's edge (deeper orange),
+# text = default text colour inside dash windows, tint = background of the selected dash pane.
+DASH_TINT = {"magi": {"border": "#a85a1c", "active": "#ff4400", "text": "#d9772b", "tint": "#1f0a00"}}
+THEMED_TMUX_OPTIONS = ["status-style", "message-style", "mode-style", "pane-border-style", "pane-active-border-style",
+                       "status-left", "status-left-length", "window-status-format", "window-status-current-format"]
+
+
+def palette(variant):
+    c = tomllib.load(open(REPO / "alacritty" / f"{variant}.toml", "rb"))["colors"]
+    return {"bg": c["primary"]["background"], "fg": c["primary"]["foreground"], "accent": c["cursor"]["cursor"],
+            "second": c["selection"]["background"], "grey": c["bright"]["black"], "muted": c["normal"]["white"],
+            "ansi": [c["normal"][k] for k in ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")]
+                  + [c["bright"][k] for k in ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")]}
+
+
+def backup_once():
+    if any(BASE.glob("backup-*")):
+        return
+    dest = BASE / f"backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    dest.mkdir(parents=True)
+    for f in (TMUX_CONF, BTOP_DIR / "btop.conf", VSCODE_SETTINGS, ITERM_PREFS):
+        if f.exists():
+            shutil.copy2(f, dest / f.name)
+    print(f"backup of the original configs: {dest}")
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def apply_tmux(variant):
+    TMUX_THEME.parent.mkdir(exist_ok=True)
+    if variant == "default":
+        TMUX_THEME.write_text("# dash-theme: default look (no overrides)\n")
+    else:
+        p, badge = palette(variant), VARIANTS[variant][0]
+        t = DASH_TINT.get(variant, {})
+        p = dict(p, grey_border=t.get("border", p["grey"]), active_border=t.get("active", p["accent"]))
+        TMUX_THEME.write_text(f"""# dash-theme: {variant} - generated, edit ~/.local/bin/dash-theme instead
+set -g status-style "bg={p['bg']},fg={p['accent']}"
+set -g message-style "fg={p['bg']},bg={p['accent']},bold"
+set -g mode-style "fg={p['bg']},bg={p['second']}"
+set -g pane-border-style "fg={p['grey_border']}"
+set -g pane-active-border-style "fg={p['active_border']},bold"
+set -g status-left-length 30
+set -g status-left "#[fg={p['accent']},bg={p['grey']},bold] {badge} #[fg={p['fg']},bg={p['grey']},nobold]#S #[fg={p['grey']},bg={p['bg']}] "
+set -g window-status-format "#[fg={p['muted']},bg={p['bg']}] #I #{{=/18/…:{SLOGAN}}} "
+set -g window-status-current-format "#[fg={p['bg']},bg={p['accent']},bold] #I {SLOGAN} #[fg={p['accent']},bg={p['bg']},nobold]"
+""")
+    hook = "source-file -q ~/.tmux/theme.conf"
+    if TMUX_CONF.exists() and hook not in TMUX_CONF.read_text():
+        with open(TMUX_CONF, "a") as fh:
+            fh.write(f"\n# colours: written by dash-theme (magi | eva01 | eva02 | default); keep this line last\n{hook}\n")
+    paint = "set-hook -g client-attached 'run-shell -b \"~/.local/bin/dash-theme paint\"'"
+    if TMUX_CONF.exists() and "dash-theme paint" not in TMUX_CONF.read_text():
+        with open(TMUX_CONF, "a") as fh:
+            fh.write(f"# terminals that attach later get the active palette too (no-op while the theme is default)\n{paint}\n")
+    for opt in THEMED_TMUX_OPTIONS:          # drop what a previous variant set, then re-read the base config
+        tmux("set", "-gu", opt)
+    tmux("source-file", str(TMUX_CONF))
+    style_dash_windows(variant)
+
+
+def style_dash_windows(variant=None):
+    """Window-level colours for every `dash` window: default text orange, selected pane tinted. Window options,
+    so Claude's own windows are untouched; `-u` removes them again for variants without a tint."""
+    if variant is None:
+        variant = STATE.read_text().strip() if STATE.exists() else "default"
+    t = DASH_TINT.get(variant)
+    for line in tmux("list-windows", "-a", "-F", "#{window_id} #{window_name}").stdout.splitlines():
+        wid, _, name = line.partition(" ")
+        if name != "dash":
+            continue
+        if t:
+            tmux("set", "-w", "-t", wid, "window-style", f"fg={t['text']}")
+            tmux("set", "-w", "-t", wid, "window-active-style", f"fg={t['text']},bg={t['tint']}")
+        else:
+            tmux("set", "-wu", "-t", wid, "window-style")
+            tmux("set", "-wu", "-t", wid, "window-active-style")
+
+
+def apply_btop(variant):
+    themes = BTOP_DIR / "themes"
+    themes.mkdir(parents=True, exist_ok=True)
+    for f in (REPO / "btop").glob("*.theme"):
+        shutil.copy2(f, themes / f.name)
+    conf = BTOP_DIR / "btop.conf"
+    name = "Default" if variant == "default" else variant
+    if conf.exists():
+        conf.write_text(re.sub(r'(?m)^color_theme = .*$', f'color_theme = "{name}"', conf.read_text()))
+    # dashboard btops run under the dash-btop watchdog: end them and they come back themed
+    for line in tmux("list-panes", "-a", "-F", "#{window_name} #{pane_index} #{pane_pid}").stdout.splitlines():
+        wname, idx, pid = line.split()
+        if wname == "dash" and idx == "0":
+            subprocess.run(["pkill", "-TERM", "-P", pid, "-x", "btop"])
+
+
+def iterm_color(hexcode):
+    r, g, b = (int(hexcode[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return {"Red Component": r, "Green Component": g, "Blue Component": b, "Alpha Component": 1, "Color Space": "sRGB"}
+
+
+ITERM_KEYS = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+
+
+def original_colours():
+    """The colours of the untouched Default profile (coolnight), read from the backup of iTerm's preferences."""
+    backups = sorted(BASE.glob("backup-*/com.googlecode.iterm2.plist"))
+    if not backups:
+        return None
+    prefs = plistlib.load(open(backups[0], "rb"))
+    prof = next((b for b in prefs.get("New Bookmarks", []) if b.get("Guid") == prefs.get("Default Bookmark Guid")), None)
+    if not prof:
+        return None
+
+    def hexof(key):
+        c = prof.get(key + " (Dark)") or prof.get(key)
+        return "#%02x%02x%02x" % tuple(round(c[k] * 255) for k in ("Red Component", "Green Component", "Blue Component"))
+
+    return {"bg": hexof("Background Color"), "fg": hexof("Foreground Color"), "accent": hexof("Cursor Color"),
+            "second": hexof("Selection Color"), "seltext": hexof("Selected Text Color"), "curtext": hexof("Cursor Text Color"),
+            "bold": hexof("Bold Color"), "link": hexof("Link Color"), "ansi": [hexof(f"Ansi {i} Color") for i in range(16)]}
+
+
+def palette_escapes(variant):
+    """iTerm SetColors escapes for a variant ('' if the original colours are unknown)."""
+    p = original_colours() if variant == "default" else palette(variant)
+    if not p:
+        return ""
+    pairs = {"bg": p["bg"], "fg": p["fg"], "bold": p.get("bold", p["fg"]), "link": p.get("link", p["ansi"][12]),
+             "selbg": p["second"], "selfg": p.get("seltext", p["bg"]), "curbg": p["accent"], "curfg": p.get("curtext", p["bg"])}
+    pairs.update({name: p["ansi"][i] for i, name in enumerate(ITERM_KEYS)})
+    pairs.update({"br_" + name: p["ansi"][8 + i] for i, name in enumerate(ITERM_KEYS)})
+    return "".join(f"\033]1337;SetColors={k}={v.lstrip('#')}\a" for k, v in pairs.items())
+
+
+def paint_clients(variant):
+    """Send the palette straight to each terminal showing tmux (iTerm's SetColors escape).
+    No preset or profile has to exist on that machine, so it also themes an iTerm that is SSH'd in."""
+    payload = palette_escapes(variant)
+    if not payload:
+        return 0
+    if variant == "default":
+        payload = "\033]1337;SetProfile=Default\a" + payload   # undo an earlier SetProfile=MAGI on local sessions
+    done = 0
+    for tty in tmux("list-clients", "-F", "#{client_tty}").stdout.split():
+        try:
+            with open(tty, "w") as fh:
+                fh.write(payload)
+            done += 1
+        except OSError:
+            pass
+    return done
+
+
+ZSHRC = HOME / ".zshrc"
+ZSH_BLOCK = """# >>> dash-theme >>> a new iTerm window (local, or SSH'd in) takes the active palette. Must stay ABOVE the
+# powerlevel10k instant-prompt block: that is the only place output is allowed. An empty paint.esc = theme "default".
+if [[ -o interactive && -z $TMUX && ( $TERM_PROGRAM == iTerm.app || $LC_TERMINAL == iTerm2 ) && -s ~/.local/share/dash-theme/paint.esc ]]; then
+  command cat ~/.local/share/dash-theme/paint.esc > /dev/tty 2>/dev/null
+fi
+# <<< dash-theme <<<
+"""
+
+
+def apply_new_shells(variant):
+    """Save the palette where ~/.zshrc can cat it, and install the (one-time) zshrc block."""
+    (BASE / "paint.esc").write_text("" if variant == "default" else palette_escapes(variant))
+    if ZSHRC.exists() and ">>> dash-theme >>>" not in ZSHRC.read_text():
+        keep = sorted(BASE.glob("backup-*"))[0] / "zshrc-before-dash-theme"
+        if not keep.exists():
+            shutil.copy2(ZSHRC, keep)
+        ZSHRC.write_text(ZSH_BLOCK + ZSHRC.read_text())
+
+
+def apply_iterm(variant):
+    profiles = []
+    for v, (badge, _) in VARIANTS.items():
+        p = palette(v)
+        prof = {"Name": badge, "Guid": f"dash-theme-{v}", "Dynamic Profile Parent Name": "Default",
+                "Use Separate Colors for Light and Dark Mode": False,
+                "Background Color": iterm_color(p["bg"]), "Foreground Color": iterm_color(p["fg"]),
+                "Bold Color": iterm_color(p["fg"]), "Cursor Color": iterm_color(p["accent"]),
+                "Cursor Text Color": iterm_color(p["bg"]), "Selection Color": iterm_color(p["second"]),
+                "Selected Text Color": iterm_color(p["bg"]), "Link Color": iterm_color(p["ansi"][12]),
+                "Badge Color": {**iterm_color(p["accent"]), "Alpha Component": 0.5}}
+        prof.update({f"Ansi {i} Color": iterm_color(c) for i, c in enumerate(p["ansi"])})
+        profiles.append(prof)
+    # Written once only: you may make the MAGI dynamic profile your iTerm default and mark it "rewritable",
+    # after which iTerm itself saves your edits into this file - regenerating it would throw them away.
+    if not ITERM_DYNAMIC.exists():
+        ITERM_DYNAMIC.parent.mkdir(parents=True, exist_ok=True)
+        ITERM_DYNAMIC.write_text(json.dumps({"Profiles": profiles}, indent=2))
+    return paint_clients(variant)
+
+
+def apply_vscode(variant):
+    if not Path(CODE).exists() or not VSCODE_SETTINGS.exists():
+        return "VS Code not found - skipped"
+    if variant != "default":
+        listed = subprocess.run([CODE, "--list-extensions"], capture_output=True, text=True).stdout.lower()
+        if "sinsusquid.magi-theme" not in listed:
+            vsix = sorted((REPO / "vscode").glob("magi-theme-*.vsix"))[-1]
+            subprocess.run([CODE, "--install-extension", str(vsix)], capture_output=True, text=True)
+    settings = json.loads(VSCODE_SETTINGS.read_text())
+    original = BASE / "vscode-original-theme.json"
+    if not original.exists():
+        original.write_text(json.dumps({"workbench.colorTheme": settings.get("workbench.colorTheme")}))
+    if variant == "default":
+        before = json.loads(original.read_text())["workbench.colorTheme"]
+        if before is None:
+            settings.pop("workbench.colorTheme", None)
+        else:
+            settings["workbench.colorTheme"] = before
+    else:
+        settings["workbench.colorTheme"] = VARIANTS[variant][1]
+    VSCODE_SETTINGS.write_text(json.dumps(settings, indent=4) + "\n")
+    return "ok"
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if arg == "paint":                       # tmux client-attached hook
+        active = STATE.read_text().strip() if STATE.exists() else "default"
+        if active != "default":
+            paint_clients(active)
+        style_dash_windows(active)
+        return
+    if arg == "style":                       # tmux-dashboard, after it builds a window
+        style_dash_windows()
+        return
+    if arg == "status":
+        print("active:", STATE.read_text().strip() if STATE.exists() else "default")
+        return
+    if arg not in (*VARIANTS, "default"):
+        sys.exit(__doc__)
+    if not REPO.exists():
+        sys.exit(f"theme files missing: {REPO}")
+    backup_once()
+    apply_tmux(arg)
+    apply_btop(arg)
+    print("terminals painted:", apply_iterm(arg))
+    apply_new_shells(arg)
+    print("vscode:", apply_vscode(arg))
+    colours = BASE / "colours.json"          # read by the dashboard widgets (clock-panel)
+    if arg == "default":
+        colours.write_text("{}\n")
+    else:
+        p = palette(arg)
+        colours.write_text(json.dumps({"accent": p["accent"], "second": p["second"], "grey": p["grey"]}) + "\n")
+    STATE.write_text(arg + "\n")
+    print(f"theme: {arg}")
+
+
+main()

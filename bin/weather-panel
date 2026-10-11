@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Weather widget for the tmux dashboard: now + next days, Open-Meteo (free, no key).
+
+Location is NYC; edit LAT/LON/PLACE below. Refreshes every
+15 min and shares one cache file between dashboards, so several panes = one request.
+Adapts to the pane: 2 rows = now + tomorrow, 3 rows = now + 3-day strip, 4+ rows = one day per line.
+"""
+import json, os, re, shutil, signal, sys, tempfile, time, urllib.request
+from pathlib import Path
+
+LAT, LON, PLACE, TZ = 40.7128, -74.0060, "NYC", "America/New_York"
+EVERY = 15 * 60
+CACHE = Path.home() / ".claude" / "dash" / "weather.json"
+URL = (f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"
+       "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m"
+       "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
+       f"&timezone={TZ.replace('/', '%2F')}&forecast_days=4")
+DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+YELLOW, BLUE, CYAN, WHITE = "\033[33m", "\033[34m", "\033[36m", "\033[37m"
+# WMO weather codes -> (glyph, colour, word); glyphs chosen to be single-width in Menlo/Meslo
+CODES = [((0,), "☀", YELLOW, "clear"), ((1, 2), "☼", YELLOW, "partly cloudy"), ((3,), "☁", WHITE, "overcast"),
+         ((45, 48), "≡", WHITE, "fog"), ((51, 53, 55, 56, 57), "☂", CYAN, "drizzle"),
+         ((61, 63, 65, 66, 67, 80, 81, 82), "☂", BLUE, "rain"), ((71, 73, 75, 77, 85, 86), "❄", CYAN, "snow"),
+         ((95, 96, 99), "⚡", YELLOW, "thunderstorm")]
+
+
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def fit(line, width):
+    """Cut to `width` visible cells keeping escape codes intact (a wrapped line would scroll the pane)."""
+    out, seen, pos = [], 0, 0
+    for m in ANSI.finditer(line):
+        chunk = line[pos:m.start()]
+        take = max(0, min(len(chunk), width - seen))
+        out.append(chunk[:take]); seen += take
+        out.append(m.group()); pos = m.end()
+    out.append(line[pos:][:max(0, width - seen)])
+    return "".join(out) + OFF
+
+
+def f(c):
+    return c * 9 / 5 + 32
+
+
+def look(code):
+    for codes, glyph, colour, word in CODES:
+        if code in codes:
+            return glyph, colour, word
+    return "?", WHITE, f"code {code}"
+
+
+def fetch():
+    """Refresh the shared cache if it is older than EVERY; never raises."""
+    try:
+        if CACHE.exists() and time.time() - CACHE.stat().st_mtime < EVERY:
+            return
+        with urllib.request.urlopen(URL, timeout=15) as r:
+            data = json.load(r)
+        data["_fetched"] = time.time()
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CACHE.parent, prefix=".tmp-")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, CACHE)
+    except Exception:
+        if CACHE.exists():
+            os.utime(CACHE, (time.time(), time.time() - EVERY + 120))  # failed: retry in 2 min, keep old data
+
+
+def render():
+    cols, rows = shutil.get_terminal_size()
+    try:
+        d = json.loads(CACHE.read_text())
+        c, day = d["current"], d["daily"]
+    except (OSError, ValueError, KeyError):
+        return "\033[H" + f"{BOLD} Weather{OFF}\033[K\n{DIM} waiting for open-meteo.com…{OFF}\033[K\033[J"
+    g, col, word = look(c["weather_code"])
+    age = time.time() - d.get("_fetched", 0)
+    stale = f"  {DIM}({int(age // 60)} min old){OFF}" if age > 2 * EVERY else ""
+    details = f"{DIM} · feels {c['apparent_temperature']:.0f}° · {c['relative_humidity_2m']}% · {c['wind_speed_10m']:.0f} km/h{OFF}"
+    tc = c['temperature_2m']
+    now = f" {BOLD}{PLACE}{OFF} {col}{g}{OFF} {BOLD}{tc:.0f}°C{OFF}{DIM}·{f(tc):.0f}°F{OFF} {word}" + (details if cols >= 60 else "") + stale
+    days = []
+    for i in range(1, len(day["time"])):
+        dg, dcol, dword = look(day["weather_code"][i])
+        name = time.strftime("%a", time.strptime(day["time"][i], "%Y-%m-%d"))
+        rain = day["precipitation_probability_max"][i]
+        days.append((name, dg, dcol, dword, day["temperature_2m_max"][i], day["temperature_2m_min"][i], rain))
+    out = [now]
+    if rows >= 4:
+        for name, dg, dcol, dword, hi, lo, rain in days[:rows - 1]:
+            out.append(f" {name} {dcol}{dg}{OFF} {hi:.0f}/{lo:.0f}°C {DIM}{f(hi):.0f}/{f(lo):.0f}°F{OFF} " + (f"{dword:<13}" if cols >= 52 else "")
+                       + f"{DIM}{BLUE if rain >= 50 else ''}☂ {rain}%{OFF}")
+    else:
+        strip = "  ".join(f"{n} {dc}{dg}{OFF} {hi:.0f}/{lo:.0f}°C{DIM}·{f(hi):.0f}/{f(lo):.0f}°F {BLUE if r >= 50 else ''}☂{r}%{OFF}"
+                           for n, dg, dc, _, hi, lo, r in days[:3 if rows >= 3 else 1])
+        out.append(" " + strip)
+    out = [fit(l, cols - 1) for l in out[:max(rows, 1)]]
+    return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
+
+
+if "--once" in sys.argv:
+    fetch()
+    print(render())
+    sys.exit(0)
+sys.stdout.write("\033[?25l\033[2J")
+signal.signal(signal.SIGWINCH, lambda *_: (sys.stdout.write(render()), sys.stdout.flush()))   # redraw on pane resize
+try:
+    while True:
+        fetch()
+        sys.stdout.write(render())
+        sys.stdout.flush()
+        time.sleep(30)
+except KeyboardInterrupt:
+    pass
+finally:
+    sys.stdout.write("\033[?25h\n")

@@ -1,0 +1,22 @@
+#!/bin/bash
+# btop for the dashboard, restarted if it exits or freezes.
+# btop 1.4.7 froze once on the dashboard Mac (clock stopped, 0% CPU for 13 h). A live btop always burns a
+# little CPU per refresh, so "CPU time did not move for 2 minutes" is a reliable freeze signal.
+export PATH="/opt/homebrew/bin:$PATH"
+trap 'kill "$pid" 2>/dev/null; exit 0' INT TERM HUP
+while :; do
+    btop "$@" < /dev/tty &   # bash gives background jobs /dev/null as stdin; btop needs the pane's tty
+    pid=$!
+    last="" stale=0 ticks=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1                                   # notice an exit within a second...
+        ticks=$((ticks + 1))
+        [ $((ticks % ${DASH_BTOP_CHECK:-30})) -eq 0 ] || continue   # ...but only test for a freeze every 30 s
+        now=$(ps -o time= -p "$pid" 2>/dev/null)
+        if [ -n "$now" ] && [ "$now" = "$last" ]; then stale=$((stale + 1)); else stale=0; fi
+        last=$now
+        [ "$stale" -ge 4 ] && kill -9 "$pid" 2>/dev/null
+    done
+    wait "$pid" 2>/dev/null
+    sleep 1
+done

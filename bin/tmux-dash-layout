@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Fit every tmux "dash" window to the shape of the screen it is on.
+
+wide  (landscape)               tall  (portrait monitor)
++---------+---------------+     +----------------------+
+|         |   sessions    |     |         btop         |
+|  btop   +---------------+     +----------------------+
+|         |     usage     |     |        slurm         |
+|         +---------------+     +-----------+----------+
++---------+    sensors    |     | sessions  |  usage   |
+|  slurm  +---------+-----+     +-----------+----------+
+|         |  clock  |spot-|     |  sensors  |  clock   |
+|         +---------+ ify |     |           +----------+
+|         | weather |     |     |           | weather  |
++---------+---------+-----+     |           +----------+
+                                |           | spotify  |
+                                +-----------+----------+
+
+Run with no arguments (tmux `window-resized` hook, and tmux-dashboard after it
+builds a window). Panes are found by the command they run (ROLES), in the order btop, slurm, sessions, usage, sensors, clock,
+weather, spotify, [local jobs]; one custom layout string per shape is enough, tmux checks its checksum.
+The optional 9th pane (local-jobs-panel) sits beside slurm in tall mode and under it in wide mode.
+"""
+import subprocess
+
+ROLES = ["dash-btop", "slurm-panel", "claude-sessions-panel", "claude-usage-panel", "sensors-panel",
+         "clock-panel", "weather-panel", "spotify-panel", "local-jobs-panel"]   # pane order the layouts assume
+SENSORS_H, CLOCK_H = 10, 7   # rows the widgets need
+PANEL_W = (56, 64)           # min / max width of the right-hand column in wide mode
+TALL_BELOW = 2.0             # width/height under this (cells are ~2x taller than wide) = portrait
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True).stdout.strip()
+
+
+def checksum(layout):
+    c = 0
+    for ch in layout:
+        c = ((c >> 1) + ((c & 1) << 15) + ord(ch)) & 0xFFFF
+    return f"{c:04x}"
+
+
+def wide(W, H, p):
+    jobs = p[8] if len(p) > 8 else None
+    right = min(max(PANEL_W[0], round(W * 0.40)), PANEL_W[1])
+    left, x = W - 1 - right, W - right
+    roomy = H >= 46
+    # bottom-right row holds clock over weather (left) and Spotify (right)
+    usage, slurm, clock_h, wx_h = (13, 11, 5, 3) if roomy else (7, 8, 3, 3)   # big digits need 5 rows
+    bottom = clock_h + wx_h + 1
+    jobs_h = 6 if jobs else 0
+    if jobs:
+        slurm = max(6, slurm - 3)
+    btop = H - slurm - jobs_h - (2 if jobs else 1)
+    sess = H - usage - SENSORS_H - bottom - 3
+    y_use, y_sens, y_bot = sess + 1, sess + usage + 2, sess + usage + SENSORS_H + 3
+    sw = 22 if roomy else 20                      # Spotify keeps a narrow strip; clock + weather get the rest
+    cw = right - sw - 1
+    jobs_cell = f",{left}x{jobs_h},0,{btop + slurm + 2},{jobs}" if jobs else ""
+    return (f"{W}x{H},0,0{{{left}x{H},0,0[{left}x{btop},0,0,{p[0]},{left}x{slurm},0,{btop + 1},{p[1]}{jobs_cell}],"
+            f"{right}x{H},{x},0["
+            f"{right}x{sess},{x},0,{p[2]},"
+            f"{right}x{usage},{x},{y_use},{p[3]},"
+            f"{right}x{SENSORS_H},{x},{y_sens},{p[4]},"
+            f"{right}x{bottom},{x},{y_bot}{{{cw}x{bottom},{x},{y_bot}[{cw}x{clock_h},{x},{y_bot},{p[5]},"
+            f"{cw}x{wx_h},{x},{y_bot + clock_h + 1},{p[6]}],"
+            f"{right - cw - 1}x{bottom},{x + cw + 1},{y_bot},{p[7]}}}]}}")
+
+
+def tall(W, H, p):
+    mid = max(8, min(20, H // 5))
+    slurm = max(8, min(12, H // 8))
+    bottom = 13                                  # sensors | [clock 3, weather 4, spotify 4]
+    top = H - slurm - mid - bottom - 3
+    half = W // 2
+    sens_w = min(58, half)
+    y_slurm, y_mid, y_bot = top + 1, top + slurm + 2, top + slurm + mid + 3
+    rw, ch, wh = W - sens_w - 1, 5, 4           # clock keeps its big digits; Spotify gets the 2 rows left
+    if len(p) > 8:
+        sw = max(60, W * 11 // 20)               # SLURM keeps the wider half; its columns need ~60
+        sw = min(sw, W - 30)
+        row = (f"{W}x{slurm},0,{y_slurm}{{{sw}x{slurm},0,{y_slurm},{p[1]},"
+               f"{W - sw - 1}x{slurm},{sw + 1},{y_slurm},{p[8]}}},")
+    else:
+        row = f"{W}x{slurm},0,{y_slurm},{p[1]},"
+    return (f"{W}x{H},0,0[{W}x{top},0,0,{p[0]},"
+            f"{row}"
+            f"{W}x{mid},0,{y_mid}{{{half}x{mid},0,{y_mid},{p[2]},"
+            f"{W - half - 1}x{mid},{half + 1},{y_mid},{p[3]}}},"
+            f"{W}x{bottom},0,{y_bot}{{{sens_w}x{bottom},0,{y_bot},{p[4]},"
+            f"{rw}x{bottom},{sens_w + 1},{y_bot}[{rw}x{ch},{sens_w + 1},{y_bot},{p[5]},"
+            f"{rw}x{wh},{sens_w + 1},{y_bot + ch + 1},{p[6]},"
+            f"{rw}x{bottom - ch - wh - 2},{sens_w + 1},{y_bot + ch + wh + 2},{p[7]}]}}]")
+
+
+for line in tmux("list-windows", "-a", "-F", "#{window_id} #{window_name} #{window_width} #{window_height}").splitlines():
+    wid, name, W, H = line.split()
+    W, H = int(W), int(H)
+    if name != "dash" or W < 60 or H < 28:
+        continue
+    by_role = {}
+    for row in tmux("list-panes", "-t", wid, "-F", "#{pane_id}\t#{pane_start_command}").splitlines():
+        pid, _, cmd = row.partition("\t")
+        for i, role in enumerate(ROLES):
+            if role in cmd:
+                by_role[i] = pid.replace("%", "")
+    if not all(i in by_role for i in range(8)):
+        continue
+    panes = [by_role[i] for i in sorted(by_role)]
+    # tmux fills a custom layout's cells in window index order and ignores the ids in it, so put the panes in role order
+    now = tmux("list-panes", "-t", wid, "-F", "#{pane_id}").replace("%", "").split()
+    order = panes[:2] + panes[8:] + panes[2:8]       # local jobs is the 3rd cell in both layouts' traversal
+    for i, want in enumerate(order):
+        if now[i] != want:
+            subprocess.run(["tmux", "swap-pane", "-d", "-s", f"%{want}", "-t", f"%{now[i]}"])
+            j = now.index(want)
+            now[i], now[j] = now[j], now[i]
+    body = tall(W, H, panes) if W / H < TALL_BELOW else wide(W, H, panes)
+    layout = f"{checksum(body)},{body}"
+    if tmux("display", "-p", "-t", wid, "#{window_layout}") != layout:
+        subprocess.run(["tmux", "select-layout", "-t", wid, layout])

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Claude Code status line + data feed for the tmux dashboard's usage panel.
+
+Claude Code pipes a JSON blob to this script on every status refresh. It holds
+what `/usage` shows (rate_limits: 5-hour / 7-day windows) and the session's
+context-window fill. We (1) save it to ~/.claude/dash/status/<session>.json for
+claude-usage-panel, and (2) print a compact one-line summary for the session.
+No credentials are read and nothing leaves the machine.
+"""
+import json, os, sys, tempfile, time
+from pathlib import Path
+
+OUT = Path.home() / ".claude" / "dash" / "status"
+
+
+def pct(v):
+    return None if v is None else f"{float(v):.0f}%"
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return
+    sid = str(data.get("session_id") or "unknown").replace("/", "_")
+    data["_saved_at"] = time.time()
+    try:
+        OUT.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=OUT, prefix=".tmp-")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, OUT / f"{sid}.json")  # atomic: the panel never sees a half-written file
+    except OSError:
+        pass
+
+    parts = []
+    model = (data.get("model") or {}).get("display_name")
+    if model:
+        parts.append(model)
+    ctx = pct((data.get("context_window") or {}).get("used_percentage"))
+    if ctx:
+        parts.append(f"ctx {ctx}")
+    limits = data.get("rate_limits") or {}
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        used = pct((limits.get(key) or {}).get("used_percentage"))
+        if used:
+            parts.append(f"{label} {used}")
+    print(" · ".join(parts))
+
+
+main()

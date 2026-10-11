@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Local jobs widget for the tmux dashboard: what Claude sessions have running on this Mac.
+
+Every process a Claude Code session launches (Bash tool, background tasks, nohup'd
+alignments...) inherits CLAUDE_PID in its environment, and keeps it after being
+re-parented to launchd - so `ps -E` finds detached jobs a plain process-tree walk
+would lose. A job is one Bash-tool invocation (the `zsh -c ... eval '<cmd>'` wrapper)
+or one detached root; its children are folded in (CPU and RSS summed).
+
+Keys (pane must have input on: prefix+i): s = cycle sort (age/cpu/mem/session),
+f = cycle filter (all/active/long/mine-busy), r = reset. State is shared across
+dashboards in ~/.claude/dash/localjobs.state. Flags: --once [--sort X --filter Y].
+"""
+import ctypes, ctypes.util, json, os, re, select, shlex, shutil, struct, subprocess, sys, termios, time, tty
+from pathlib import Path
+
+DASH = Path.home() / ".claude" / "dash"
+STATE = DASH / "localjobs.state"
+HIST = DASH / "localjobs-history.json"
+KEEP_DONE = 24 * 3600   # s - how long finished jobs stay listed
+MIN_DONE = 30           # s - shorter runs are not worth a history row
+REGISTRY = Path.home() / ".claude" / "sessions"
+SORTS, FILTERS = ("age", "cpu", "mem", "session"), ("all", "active", "long", "busy-sessions", "done")
+MIN_AGE = 5            # s - ignore the plumbing commands a tool call spawns for an instant
+ACTIVE_CPU = 1.0       # % - "active" filter
+LONG_AGE = 3600        # s - "long" filter
+DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+GREEN, YELLOW, RED, CYAN = "\033[32m", "\033[33m", "\033[31m", "\033[36m"
+ANSI = re.compile(r"\033\[[0-9;]*m")
+WRAP = re.compile(r"eval '(.*)' < /dev/null")
+NOISE = re.compile(r"^(caffeinate|sleep|ps|head|tail|cat|grep|tmux|local-jobs-panel)\b")
+SELF = {os.getpid(), os.getppid()}
+LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+PLUMBING = re.compile(r"(/|^)claude( |$)|claude (daemon|bg-)|local-jobs-panel")
+
+
+def fit(line, width):
+    out, seen, pos = [], 0, 0
+    for m in ANSI.finditer(line):
+        chunk = line[pos:m.start()]
+        take = max(0, min(len(chunk), width - seen))
+        out.append(chunk[:take]); seen += take
+        out.append(m.group()); pos = m.end()
+    out.append(line[pos:][:max(0, width - seen)])
+    return "".join(out) + OFF
+
+
+def etime(s):
+    d, _, rest = s.partition("-") if "-" in s else ("0", "", s)
+    parts = [int(x) for x in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(d) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def ago(sec):
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if sec >= size:
+            return f"{int(sec // size)}{unit}{int(sec % size // (size // (24 if unit == 'd' else 60 if unit == 'h' else 60)))}" \
+                   f"{'h' if unit == 'd' else 'm' if unit == 'h' else 's'}"
+    return f"{int(sec)}s"
+
+
+def _plain(cmd):
+    """Fallback label: unwrap Claude's zsh snapshot wrapper, drop path noise."""
+    m = WRAP.search(cmd)
+    if m:
+        cmd = m.group(1).replace("'\\''", "'")
+    cmd = re.sub(r"^(/bin/(ba|z)?sh|bash|zsh)\s+-c\s+", "", cmd)
+    cmd = re.sub(r"""(["'])[^"']*/([^/"']+)\1""", r"\2", cmd)   # quoted paths (they hold spaces) -> basename
+    cmd = re.sub(r"(\S*/)([^/\s]+)", r"\2", cmd)       # basenames only
+    return " ".join(cmd.split())
+
+
+OPS = {"&&", "||", ";", "|", "&", "(", ")"}
+SKIP_LEAD = {"cd", "export", "source", ".", "set", "setopt", "unset", "echo", "true", "mkdir", "ulimit", "umask", "trap",
+             "wait", "pwd", "printf", "test", "["}
+WRAPPERS = {"nohup", "time", "nice", "caffeinate", "env", "command", "exec", "stdbuf", "sudo", "timeout", "gtimeout"}
+SSH_VAL = set("pLoiFJlbcDEeIMmOQRSWw")          # ssh flags that take a value
+
+
+def _base(tok):
+    """Path-ish token -> its basename; --opt=/a/b -> --opt=b; host:/a/b -> host:b."""
+    if tok.startswith("-") and "=" in tok:
+        k, _, v = tok.partition("=")
+        return f"{k}={_base(v)}"
+    m = re.match(r"^(?:[^@/\s]+@)?([^:/\s]+):(/.*)$", tok)        # [user@]host:/path -> host:basename
+    if m and not tok.startswith("-"):
+        return f"{m.group(1)}:{os.path.basename(m.group(2).rstrip('/'))}" + ("/" if tok.endswith("/") else "")
+    if "/" in tok and not tok.startswith("-") and " " not in tok:
+        return os.path.basename(tok.rstrip("/")) + ("/" if tok.endswith("/") else "")
+    return tok
+
+
+def _segment(toks):
+    """Reduce one command segment (token list) to 'tool what' - the part a person would recognise."""
+    while toks and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]) or os.path.basename(toks[0]) in WRAPPERS):
+        w = os.path.basename(toks[0])
+        toks = toks[1:]
+        if w in ("timeout", "gtimeout") and toks and re.match(r"^[\d.]+[smhd]?$", toks[0]):
+            toks = toks[1:]
+        while w in ("caffeinate", "nice", "env", "stdbuf") and toks and toks[0].startswith("-"):
+            toks = toks[2:] if w == "caffeinate" and toks[0] in ("-t", "-w") else toks[1:]
+    if not toks:
+        return ""
+    tool, rest = os.path.basename(toks[0]), toks[1:]
+    if tool in ("conda", "mamba", "micromamba") and rest[:1] == ["run"]:
+        env = rest[rest.index("-n") + 1] if "-n" in rest and rest.index("-n") + 1 < len(rest) else None
+        rest = [t for i, t in enumerate(rest[1:]) if not (t in ("-n", "-p", "--name", "--no-capture-output")
+                                                          or (i and rest[i] in ("-n", "-p", "--name")))]
+        return (f"{env}: " if env else "") + (_segment(rest) if rest else tool)
+    if tool in ("bash", "sh", "zsh") and "-c" in rest and rest.index("-c") + 1 < len(rest):
+        return describe(rest[rest.index("-c") + 1])
+    if tool in ("bash", "sh", "zsh", "Rscript", "R", "perl", "node", "ruby") or re.match(r"(?i)python[\d.]*$", tool):
+        if "-c" in rest and tool not in ("bash", "sh", "zsh"):
+            i = rest.index("-c")
+            return f"{tool} -c " + " ".join(rest[i + 1:i + 2]).replace("\n", " ")[:40]
+        if "-m" in rest:
+            return f"{tool} -m " + " ".join(_base(t) for t in rest[rest.index("-m") + 1:])
+        j = next((i for i, t in enumerate(rest) if not t.startswith("-")), None)
+        if j is None:
+            return tool
+        lead = "" if tool in ("bash", "sh", "zsh") else tool + " "
+        return lead + " ".join(_base(t) for t in rest[j:])
+    if tool == "rsync":
+        pos = [t for t in rest if not t.startswith("-")]
+        if len(pos) >= 2:
+            return f"rsync {_base(pos[-2])} → {_base(pos[-1])}"
+    if tool == "ssh":
+        i, host = 0, None
+        while i < len(rest):
+            t = rest[i]
+            if t.startswith("-"):
+                i += 2 if len(t) == 2 and t[1] in SSH_VAL else 1
+            else:
+                host = t
+                break
+        remote = rest[i + 1:]
+        if host and remote:
+            return f"ssh {host}: " + (describe(remote[0]) if len(remote) == 1 else describe(" ".join(remote)))
+        if host:
+            return f"ssh {host}"
+    return " ".join([tool] + [_base(t) for t in rest])
+
+
+def describe(cmd):
+    """Label for a job: the tool plus the thing it works on (script, sample, src → dst), not the shell plumbing."""
+    m = WRAP.search(cmd)
+    if m:
+        cmd = m.group(1).replace("'\\''", "'")
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return _plain(cmd)
+    segs, cur = [], []
+    for t in toks:
+        if t in OPS:
+            segs.append(cur); cur = []
+        elif re.fullmatch(r"[<>&]+", t):               # redirection: drop it, and a `2` / `1` fd that precedes it
+            if cur and cur[-1] in ("1", "2"):
+                cur.pop()
+            segs.append(cur); cur = []
+            segs.append(None)                          # marks "rest belongs to the redirect target"
+        else:
+            cur.append(t)
+    segs.append(cur)
+    work, skip_next = [], False
+    for sg in segs:
+        if sg is None:
+            skip_next = True
+            continue
+        if skip_next:                                  # the file after `>` - not a command
+            sg, skip_next = sg[1:], False
+        if sg and os.path.basename(sg[0]) not in SKIP_LEAD and not re.match(r"^[A-Za-z_]\w*=\S*$", " ".join(sg)):
+            work.append(sg)
+    for sg in work:
+        label = _segment(sg)
+        if label:
+            return " ".join(label.split())
+    return _plain(cmd)
+
+
+def short_cmd(cmd):
+    try:
+        return describe(cmd)
+    except Exception:
+        return _plain(cmd)
+
+
+def sessions():
+    """CLAUDE_PID -> (tmux window index, label), from the session registry + tmux pane titles."""
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}\x1f#{window_index}\x1f#{pane_title}"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        out = ""
+    panes = {p[0]: p[1:] for p in (l.split("\x1f") for l in out.splitlines()) if len(p) == 3}
+    res = {}
+    for f in REGISTRY.glob("*.json"):
+        try:
+            s = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        pane = panes.get(s.get("tmux", "").rpartition(".")[2])
+        title = re.sub(r"^[^\w(]\s+", "", pane[1]).strip() if pane else s.get("name", "")
+        res[s.get("pid")] = (pane[0] if pane else "-", title or Path(s.get("cwd", "")).name, s.get("status", "?"))
+    return res
+
+
+def read_env(pid):
+    """CLAUDE_PID from a process's initial environment (sysctl KERN_PROCARGS2; `ps e` shows nothing here)."""
+    mib = (ctypes.c_int * 3)(1, 49, pid)
+    size = ctypes.c_size_t(0)
+    if LIBC.sysctl(mib, 3, None, ctypes.byref(size), None, 0):
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    if LIBC.sysctl(mib, 3, buf, ctypes.byref(size), None, 0):
+        return None
+    raw = buf.raw[:size.value]
+    argc = struct.unpack("i", raw[:4])[0]
+    items = raw[4:].partition(b"\0")[2].lstrip(b"\0").split(b"\0")
+    for x in items[argc:]:
+        if x.startswith(b"CLAUDE_PID="):
+            return int(x[11:] or 0)
+    return None
+
+
+def collect(live):
+    """Jobs = roots of work started by a live Claude session. Ownership: walk up the parent chain to a session pid;
+    failing that (nohup/setsid orphans), CLAUDE_PID in the env - but only if it names a live session, because tmux
+    and apps launched from a session carry a stale one."""
+    out = subprocess.run(["ps", "-U", str(os.getuid()), "-axo", "pid=,ppid=,etime=,pcpu=,rss=,command="],
+                         capture_output=True, text=True).stdout
+    procs = {}
+    for l in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(.*)", l)
+        if m:
+            pid, ppid, et, cpu, rss, cmd = m.groups()
+            procs[int(pid)] = dict(pid=int(pid), ppid=int(ppid), age=etime(et), cpu=float(cpu),
+                                   rss=int(rss) // 1024, cmd=cmd)
+    kids = {}
+    for p in procs.values():
+        kids.setdefault(p["ppid"], []).append(p["pid"])
+
+    def owner(pid):
+        seen, cur = set(), pid
+        while cur in procs and cur not in seen:
+            seen.add(cur)
+            cur = procs[cur]["ppid"]
+            if cur in live:
+                return cur
+        env = read_env(pid)
+        return env if env in live else None
+
+    def plumbing(c):
+        return bool(PLUMBING.search(c))
+
+    own = {pid: owner(pid) for pid in procs}
+    jobs = []
+    for p in procs.values():
+        o = own[p["pid"]]
+        if o is None or p["pid"] in SELF or plumbing(p["cmd"]):
+            continue
+        par = procs.get(p["ppid"])
+        if par and own.get(par["pid"]) == o and not plumbing(par["cmd"]) and par["pid"] != o:
+            continue                                   # folded into its parent job
+        label = short_cmd(p["cmd"])
+        if not label or NOISE.match(label) or NOISE.match(_plain(p["cmd"])) or p["age"] < MIN_AGE:
+            continue
+        group, stack = [p], list(kids.get(p["pid"], []))
+        while stack:
+            k = stack.pop()
+            if k in procs:
+                group.append(procs[k]); stack += kids.get(k, [])
+        jobs.append(dict(p, label=label, owner=o, cpu=sum(g["cpu"] for g in group),
+                         rss=sum(g["rss"] for g in group), n=len(group)))
+    return jobs
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(s):
+    DASH.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s))
+    os.replace(tmp, STATE)
+
+
+def load_hist():
+    try:
+        h = json.loads(HIST.read_text())
+        return h if isinstance(h.get("seen"), dict) and isinstance(h.get("done"), list) else {"seen": {}, "done": []}
+    except (OSError, ValueError, AttributeError):
+        return {"seen": {}, "done": []}
+
+
+def update_history(jobs, where):
+    """Jobs that were running last poll and are gone now become 'done' rows. The exit code is not observable from
+    outside the process, so a finished row says when it ended and how long it ran - not whether it worked."""
+    now = time.time()
+    h = load_hist()
+    live = {}
+    for j in jobs:
+        start, key = now - j["age"], str(j["pid"])
+        old = h["seen"].get(key)
+        if old and abs(old["start"] - start) > 5:          # pid reused by a different job
+            old["end"] = old["last"]
+            h["done"].append(old)
+            old = None
+        rec = old or dict(label=j["label"], start=start, where=where(j["owner"]), rss=0)
+        rec.update(last=now, rss=max(rec["rss"], j["rss"]), label=j["label"])
+        live[key] = rec
+    for key, rec in h["seen"].items():
+        if key not in live:
+            rec["end"] = rec["last"]
+            h["done"].append(rec)
+    h["seen"] = live
+    h["done"] = [r for r in h["done"] if r["end"] > now - KEEP_DONE and r["end"] - r["start"] >= MIN_DONE][-200:]
+    DASH.mkdir(parents=True, exist_ok=True)
+    tmp = HIST.with_suffix(f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(h))
+    os.replace(tmp, HIST)                                 # several dashboards may write; last one wins, all equivalent
+    return sorted(h["done"], key=lambda r: -r["end"])
+
+
+def render(sort, flt):
+    cols, height = shutil.get_terminal_size()
+    sess = sessions()
+    jobs = collect(set(sess))
+    total = len(jobs)
+    done = update_history(jobs, lambda o: sess.get(o, ("?",))[0])
+    if flt == "active":
+        jobs = [j for j in jobs if j["cpu"] >= ACTIVE_CPU]
+    elif flt == "long":
+        jobs = [j for j in jobs if j["age"] >= LONG_AGE]
+    elif flt == "busy-sessions":
+        jobs = [j for j in jobs if sess.get(j["owner"], ("", "", ""))[2] == "busy"]
+    key = {"age": lambda j: -j["age"], "cpu": lambda j: -j["cpu"], "mem": lambda j: -j["rss"],
+           "session": lambda j: (sess.get(j["owner"], ("~",))[0].zfill(3), -j["age"])}[sort]
+    jobs.sort(key=key)
+    if flt == "done":
+        jobs = []
+    head = (f"{BOLD} Local jobs{OFF}  {CYAN}{len(jobs)}{OFF}{DIM}/{total}{OFF}   "
+            f"{DIM}sort{OFF} {sort}  {DIM}filter{OFF} {flt}  {DIM}[s] [f] [r]{OFF}")
+    out = [head]
+    cmd_w = max(12, cols - 28)
+    for j in jobs:
+        where, title, status = sess.get(j["owner"], ("?", "", "?"))
+        hot = GREEN if j["cpu"] >= 50 else YELLOW if j["cpu"] >= ACTIVE_CPU else DIM
+        out.append(f" {where:>2} {hot}{j['cpu']:5.0f}%{OFF} {j['rss']:5d}M {ago(j['age']):>6} "
+                   f"{j['label'][:cmd_w]}")
+    if not jobs and flt != "done":
+        out.append(f"{DIM}   nothing running from a Claude session{OFF}")
+    if done and flt in ("all", "long", "done"):
+        if flt == "long":
+            done = [r for r in done if r["end"] - r["start"] >= LONG_AGE]
+        out.append(f"{DIM} finished · last 24 h · exit code not observable{OFF}")
+        today = time.strftime("%Y-%m-%d")
+        for r in done:
+            end = time.strftime("%H:%M" if time.strftime("%Y-%m-%d", time.localtime(r["end"])) == today else "%a %H:%M",
+                                time.localtime(r["end"]))
+            out.append(f"{DIM} {r['where']:>2} {'■ ' + end:>7} {r['rss']:5d}M {ago(r['end'] - r['start']):>6} "
+                       f"{r['label'][:cmd_w]}{OFF}")
+    if len(out) > height:
+        hidden = len(out) - height + 1
+        out = out[:height - 1] + [f"{DIM}   … {hidden} more{OFF}"]
+    return "\033[H" + "".join(fit(l, cols - 1) + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
+
+
+def arg(name, default):
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+
+
+if "--once" in sys.argv:
+    st = load_state()
+    print(render(arg("--sort", st.get("sort", "age")), arg("--filter", st.get("filter", "all"))))
+    sys.exit(0)
+
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd) if os.isatty(fd) else None
+sys.stdout.write("\033[?25l\033[2J")
+try:
+    if saved:
+        tty.setcbreak(fd)
+    while True:
+        st = load_state()
+        sys.stdout.write(render(st.get("sort", "age"), st.get("filter", "all")))
+        sys.stdout.flush()
+        if saved and select.select([fd], [], [], 3.0)[0]:
+            k = os.read(fd, 8).decode(errors="ignore")[:1]
+            st = load_state()
+            if k == "s":
+                st["sort"] = SORTS[(SORTS.index(st.get("sort", "age")) + 1) % len(SORTS)]
+            elif k == "f":
+                st["filter"] = FILTERS[(FILTERS.index(st.get("filter", "all")) + 1) % len(FILTERS)]
+            elif k == "r":
+                st = {}
+            else:
+                continue
+            save_state(st)
+        elif not saved:
+            time.sleep(3)
+except KeyboardInterrupt:
+    pass
+finally:
+    if saved:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    sys.stdout.write("\033[?25h\n")

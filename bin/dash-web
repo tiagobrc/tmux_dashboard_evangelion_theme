@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Read-only web mirror of the tmux dashboard, for a web-view screensaver.
+
+http://127.0.0.1:8765/  picks the "dash" window whose shape matches the screen
+(portrait monitor -> the tall dashboard, landscape -> the wide one), captures
+every pane with its colours (`tmux capture-pane -e`) and lays the panes out on
+a character grid. Binds to localhost only, accepts no input, and only does any
+work while a page is actually polling it.
+"""
+import html, json, re, subprocess, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = 8765
+BASE16 = ["#15161b", "#e0566b", "#7ec86b", "#e2b455", "#5b9cf0", "#c07be0", "#4fc3c8", "#c9ccd3",
+          "#5c6170", "#ff7b8e", "#9fe08d", "#f5cf78", "#82b6ff", "#d9a0f2", "#7fe0e4", "#ffffff"]
+SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+OTHER_ESC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[A-Za-ln-z]|\x1b[()][0-9A-B]|\x0f|\x0e")
+
+
+def xterm(n):
+    if n < 16:
+        return BASE16[n]
+    if n < 232:
+        n -= 16
+        return "#%02x%02x%02x" % tuple(0 if v == 0 else 55 + v * 40 for v in (n // 36, n // 6 % 6, n % 6))
+    return "#%02x%02x%02x" % ((8 + (n - 232) * 10,) * 3)
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=10).stdout
+
+
+def ansi_to_html(text):
+    out, st = [], {"fg": None, "bg": None, "bold": False, "dim": False, "rev": False, "ul": False}
+
+    def open_span():
+        fg, bg = (st["bg"] or "#0b0c10", st["fg"] or "#c9ccd3") if st["rev"] else (st["fg"], st["bg"])
+        css = ([f"color:{fg}"] if fg else []) + ([f"background:{bg}"] if bg else []) \
+            + (["font-weight:700"] if st["bold"] else []) + (["opacity:.5"] if st["dim"] else []) \
+            + (["text-decoration:underline"] if st["ul"] else [])
+        return f'<span style="{";".join(css)}">' if css else "<span>"
+
+    pos = 0
+    out.append("<span>")
+    for m in SGR.finditer(text):
+        out.append(html.escape(text[pos:m.start()]))
+        pos = m.end()
+        codes = [int(c) if c else 0 for c in re.split("[;:]", m.group(1))] or [0]
+        i = 0
+        while i < len(codes):
+            c = codes[i]
+            if c == 0:
+                st.update(fg=None, bg=None, bold=False, dim=False, rev=False, ul=False)
+            elif c == 1: st["bold"] = True
+            elif c == 2: st["dim"] = True
+            elif c == 4: st["ul"] = True
+            elif c == 7: st["rev"] = True
+            elif c == 22: st["bold"] = st["dim"] = False
+            elif c == 24: st["ul"] = False
+            elif c == 27: st["rev"] = False
+            elif 30 <= c <= 37: st["fg"] = BASE16[c - 30]
+            elif 90 <= c <= 97: st["fg"] = BASE16[c - 82]
+            elif c == 39: st["fg"] = None
+            elif 40 <= c <= 47: st["bg"] = BASE16[c - 40]
+            elif 100 <= c <= 107: st["bg"] = BASE16[c - 92]
+            elif c == 49: st["bg"] = None
+            elif c in (38, 48) and i + 1 < len(codes):
+                key = "fg" if c == 38 else "bg"
+                if codes[i + 1] == 5 and i + 2 < len(codes):
+                    st[key] = xterm(codes[i + 2]); i += 2
+                elif codes[i + 1] == 2 and i + 4 < len(codes):
+                    st[key] = "#%02x%02x%02x" % tuple(codes[i + 2:i + 5]); i += 4
+            i += 1
+        out.append("</span>" + open_span())
+    out.append(html.escape(text[pos:]) + "</span>")
+    return "".join(out)
+
+
+def frame(shape):
+    wins = [l.split() for l in tmux("list-windows", "-a", "-F",
+            "#{window_id} #{window_name} #{window_width} #{window_height}").splitlines()]
+    dash = [(w, int(W), int(H)) for w, name, W, H in wins if name == "dash"]
+    if not dash:
+        return {"cols": 40, "rows": 3, "panes": [{"x": 1, "y": 1, "w": 38, "h": 1, "html": "no tmux dashboard window is open"}]}
+    fits = [d for d in dash if (d[1] / d[2] < 2.0) == (shape == "tall")]
+    wid, W, H = (fits or dash)[0]
+    panes = [l.split() for l in tmux("list-panes", "-t", wid, "-F",
+             "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height}").splitlines()]
+    args = []
+    for pid, *_ in panes:
+        args += ["display-message", "-p", "\x1e", ";", "capture-pane", "-e", "-p", "-t", pid, ";"]
+    chunks = tmux(*args[:-1]).split("\x1e\n")[1:]
+    out = []
+    for (pid, x, y, w, h), chunk in zip(panes, chunks):
+        lines = OTHER_ESC.sub("", chunk).split("\n")[:int(h)]
+        out.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "html": ansi_to_html("\n".join(lines))})
+    return {"cols": W, "rows": H, "panes": out}
+
+
+PAGE = """<!doctype html><meta charset=utf-8><title>dashboard</title>
+<style>
+ html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}
+ #grid{position:absolute;font-family:Menlo,'SF Mono',monospace;color:#c9ccd3;white-space:pre;transition:transform 4s ease}
+ .pane{position:absolute;overflow:hidden;white-space:pre}
+ .pane::after{content:'';position:absolute;inset:0;box-shadow:inset 0 0 0 1px rgba(255,255,255,.07);pointer-events:none}
+ #probe{position:absolute;visibility:hidden;white-space:pre;font-family:Menlo,'SF Mono',monospace}
+</style><div id=grid></div><span id=probe>0000000000</span>
+<script>
+const LH = 1.22, grid = document.getElementById('grid'), probe = document.getElementById('probe');
+let drift = 0;
+async function tick(){
+  try{
+    const shape = innerHeight > innerWidth ? 'tall' : 'wide';
+    const f = await (await fetch('/frame?shape=' + shape, {cache:'no-store'})).json();
+    probe.style.fontSize = '100px';
+    const chRatio = probe.getBoundingClientRect().width / 10 / 100;           // cell width per font px
+    const margin = 0.96;
+    const size = Math.floor(Math.min(innerWidth * margin / (f.cols * chRatio), innerHeight * margin / (f.rows * LH)) * 10) / 10;
+    const cw = size * chRatio, lh = size * LH;
+    grid.style.fontSize = size + 'px'; grid.style.lineHeight = lh + 'px';
+    grid.style.width = f.cols * cw + 'px'; grid.style.height = f.rows * lh + 'px';
+    grid.style.left = (innerWidth - f.cols * cw) / 2 + 'px'; grid.style.top = (innerHeight - f.rows * lh) / 2 + 'px';
+    grid.innerHTML = f.panes.map(p => `<div class=pane style="left:${p.x*cw}px;top:${p.y*lh}px;width:${p.w*cw}px;height:${p.h*lh}px">${p.html}</div>`).join('');
+  }catch(e){ grid.textContent = 'dashboard server not reachable'; }
+}
+// nudge the whole picture a few pixels every minute so nothing sits on the same pixels for hours
+setInterval(() => { drift = (drift + 1) % 8; const a = drift * Math.PI / 4;
+  grid.style.transform = `translate(${Math.round(Math.cos(a)*6)}px, ${Math.round(Math.sin(a)*6)}px)`; }, 60000);
+tick(); setInterval(tick, 2000);
+</script>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/frame"):
+            body = json.dumps(frame("tall" if "shape=tall" in self.path else "wide")).encode()
+            ctype = "application/json"
+        elif self.path in ("/", "/index.html"):
+            body, ctype = PAGE.encode(), "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    if "--frame" in sys.argv:
+        f = frame("tall" if "tall" in sys.argv else "wide")
+        print(f["cols"], f["rows"], [(p["x"], p["y"], p["w"], p["h"], len(p["html"])) for p in f["panes"]])
+        sys.exit(0)
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

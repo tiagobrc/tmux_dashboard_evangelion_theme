@@ -1,0 +1,50 @@
+#!/bin/bash
+# Open (or jump to) the "dash" window: btop + HPC SLURM jobs | Claude sessions + usage + sensors + clock + weather + Spotify.
+# usage: tmux-dashboard [session] [window-index] [-d]   (-d: create without switching to it)
+#        tmux-dashboard <session> --auto                (session-created hook: add it as the first window,
+#                                                        unless the session carries TMUX_NO_AUTODASH)
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+sess="${1:-$(tmux display -p '#S')}"
+idx="$2"
+detach="$3"
+
+if [ "$idx" = "--auto" ]; then
+    # tmux-claude-restore marks its sessions so it can place windows by index itself
+    tmux show-environment -t "=$sess" TMUX_NO_AUTODASH 2>/dev/null | grep -q '=1' && exit 0
+    tmux list-windows -t "=$sess" -F '#W' | grep -qx dash && exit 0
+    idx="" detach="-d" auto=1
+fi
+
+if tmux list-windows -t "=$sess" -F '#W' | grep -qx dash; then
+    exec tmux select-window -t "=$sess:dash"
+fi
+
+# no index given: take the first free one after the last window (a bare "=sess:" resolves to the current window)
+[ -n "$idx" ] || idx=$(( $(tmux list-windows -t "=$sess" -F '#{window_index}' | sort -n | tail -1) + 1 ))
+read -r win main < <(tmux new-window $detach -P -F '#{window_id} #{pane_id}' -t "=$sess:$idx" -n dash -c "$HOME" dash-btop)
+# if the window could not be created, stop: every split below would otherwise land in whatever window is current
+if [ -z "$win" ] || [ -z "$main" ]; then
+    tmux display-message "tmux-dashboard: could not create the dash window in $sess"
+    exit 1
+fi
+panel=$(tmux split-window -h -l 40% -P -F '#{pane_id}' -t "$win" -c "$HOME" claude-sessions-panel)
+clock=$(tmux split-window -v -l 7 -P -F '#{pane_id}' -t "$panel" clock-panel)
+tmux split-window -v -d -l 10 -t "$panel" sensors-panel   # lands between the sessions list and the clock
+tmux split-window -v -d -l 8 -t "$panel" claude-usage-panel   # lands right after the sessions list (pane order matters to tmux-dash-layout)
+tmux split-window -v -d -l 10 -t "$main" -c "$HOME" slurm-panel   # under btop: second in pane order
+tmux split-window -h -d -t "$clock" -c "$HOME" spotify-panel   # last in pane order
+tmux split-window -v -d -t "$clock" -c "$HOME" weather-panel   # under the clock: between clock and Spotify in pane order
+tmux split-window -v -d -t "$main" -c "$HOME" local-jobs-panel   # panes are matched by command, so position here is free
+tmux set-option -w -t "$win" remain-on-exit on          # a crashed widget leaves a dead pane, which the pane-died hook respawns
+for p in $(tmux list-panes -t "$win" -F '#{pane_id} #{pane_start_command}' | grep -v local-jobs-panel | cut -d' ' -f1); do tmux select-pane -d -t "$p"; done   # local-jobs keeps input: s/f/r sort+filter   # panes ignore keystrokes; prefix+i re-enables one
+tmux select-pane -t "$main"
+dash-theme style   # orange default text + tinted selected pane on this window
+tmux-dash-layout   # fit to this screen: wide (landscape) or tall (portrait); re-run by the window-resized hook
+
+if [ -n "$auto" ]; then
+    # put the dashboard in the first slot, keeping the user on the window they were in
+    cur=$(tmux display -p -t "=$sess:" '#{window_id}')
+    first=$(tmux list-windows -t "=$sess" -F '#{window_index}' | sort -n | head -1)
+    tmux swap-window -d -s "$win" -t "=$sess:$first"
+    tmux select-window -t "$cur"
+fi

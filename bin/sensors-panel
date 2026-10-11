@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Temperature / fan / power widget for the tmux dashboard window.
+
+Streams `macmon pipe` (sudoless Apple Silicon sensors) and redraws on every
+sample: die temperatures with sparkline history, fan speed, power draw.
+"""
+import json, re, shutil, subprocess, sys, time
+from collections import deque
+
+INTERVAL_MS = 2000
+TEMP_RANGE = (30.0, 100.0)  # fixed sparkline scale, so its height means the same thing every day
+ISMC_EVERY = 3  # read the SMC every Nth macmon sample (one read is ~0.3 s)
+BLOCKS = " ▁▂▃▄▅▆▇█"
+# iSMC reports ~160 temperature keys on an M3 Ultra; show the hottest sensor of each zone.
+# Watermark keys ("... Max"/"... Min") and fixed calibration references are left out.
+ZONES = [("CPU cores", r"^CPU (Performance|Efficiency) Core \d+$|^CPU Die Max$"),
+         ("GPU", r"^GPU \d+$"),
+         ("Memory", r"^Virtual Memory "),
+         ("Heatsink", r"^SoC Heatsink \d+$"),
+         ("SSD", r"^(SSD \d+|NAND|NVME \d+ \([AB]\))$"),
+         ("Power IC", r"^Power Delivery IC \d+$"),
+         ("Air in", r"^Airflow Front "),
+         ("Air out", r"^Airflow Rear "),
+         ("PSU", r"^Power Supply Diode$")]
+DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+GREEN, YELLOW, RED = "\033[32m", "\033[33m", "\033[31m"
+
+
+def heat(celsius):
+    return GREEN if celsius < 60 else YELLOW if celsius < 80 else RED
+
+
+def spark(values, lo, hi, width):
+    vals = list(values)[-width:]
+    span = max(hi - lo, 1e-9)
+    return "".join(BLOCKS[min(8, max(1, round((v - lo) / span * 8)))] for v in vals).rjust(width)
+
+
+def bar(frac, width):
+    full = round(max(0.0, min(1.0, frac)) * width)
+    return "█" * full + DIM + "░" * (width - full) + OFF
+
+
+def read_zones():
+    """{zone: (hottest °C, sensor count)} from `ismc temp`, or None if iSMC is unavailable."""
+    try:
+        raw = subprocess.run(["ismc", "temp", "-o", "json"], capture_output=True, text=True, timeout=10).stdout
+        sensors = {k: v["quantity"] for k, v in json.loads(raw).items() if isinstance(v.get("quantity"), (int, float))}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    zones = {}
+    for label, pattern in ZONES:
+        vals = [q for name, q in sensors.items() if re.search(pattern, name)]
+        if vals:
+            zones[label] = (max(vals), len(vals))
+    zones["_total"] = (0.0, len(sensors))
+    return zones
+
+
+def render(s, hist, zones=None):
+    cols, _ = shutil.get_terminal_size()
+    w = max(cols - 16, 6)
+    out = [f"{BOLD} Sensors{OFF}{DIM}  every {INTERVAL_MS // 1000}s, {TEMP_RANGE[0]:.0f}-{TEMP_RANGE[1]:.0f}°C scale{OFF}"]
+    for key, label in (("cpu_temp_avg", "CPU"), ("gpu_temp_avg", "GPU")):
+        t = s.get("temp", {}).get(key)
+        if t is None:
+            continue
+        hist[key].append(t)
+        out.append(f" {label} {heat(t)}{t:5.1f}°C{OFF} {heat(max(hist[key]))}{spark(hist[key], *TEMP_RANGE, w)}{OFF}")
+    fans = s.get("fans") or []
+    if fans:
+        frac = max(f["rpm"] / f["max_rpm"] for f in fans if f.get("max_rpm"))
+        rpm = " / ".join(f"{f['rpm']:.0f}" for f in fans)
+        out.append(f" Fan {bar(frac, 10)} {frac:4.0%}  {rpm} rpm")
+    sysw = s.get("sys_power")
+    if sysw is not None:
+        hist["sys_power"].append(sysw)
+        peak = max(max(hist["sys_power"]), 60.0)
+        out.append(f" Pwr {BOLD}{sysw:5.1f} W{OFF} {DIM}{spark(hist['sys_power'], 0, peak, w)}{OFF}")
+        out.append(f"{DIM}     cpu {s.get('cpu_power', 0):.1f} · gpu {s.get('gpu_power', 0):.1f}"
+                   f" · ram {s.get('ram_power', 0):.1f} W   peak {max(hist['sys_power']):.0f} W{OFF}")
+    if zones:
+        title = f" hottest per zone · {zones['_total'][1]} SMC sensors "
+        out.append(f"{DIM}{title.center(cols - 1, '─')}{OFF}")
+        cells = [f"{label:<9}{heat(t)}{t:5.1f}{OFF}" for label, (t, _) in zones.items() if label != "_total"]
+        for i in range(0, len(cells), 3):
+            out.append(" " + "    ".join(cells[i:i + 3]))
+    return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
+
+
+def stream():
+    proc = subprocess.Popen(["macmon", "pipe", "-i", str(INTERVAL_MS)],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        for line in proc.stdout:
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+    finally:
+        proc.terminate()
+
+
+hist = {k: deque(maxlen=400) for k in ("cpu_temp_avg", "gpu_temp_avg", "sys_power")}
+once = "--once" in sys.argv
+zones = None
+if not once:
+    sys.stdout.write("\033[?25l\033[2J")
+try:
+    while True:
+        try:
+            for n, sample in enumerate(stream()):
+                if n % ISMC_EVERY == 0:
+                    zones = read_zones()
+                sys.stdout.write(render(sample, hist, zones))
+                sys.stdout.flush()
+                if once:
+                    print()
+                    sys.exit(0)
+        except FileNotFoundError:
+            sys.stdout.write("\033[H macmon not found - brew install macmon\033[J")
+            sys.stdout.flush()
+        time.sleep(5)  # macmon exited or is missing: keep the pane alive and retry
+except KeyboardInterrupt:
+    pass
+finally:
+    if not once:
+        sys.stdout.write("\033[?25h\n")

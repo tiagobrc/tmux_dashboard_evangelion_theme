@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""HPC SLURM widget for the tmux dashboard: my queue + the last 24 h of finished jobs.
+
+Polls `ssh cluster` (the alias keeps a ControlMaster open, so no new logins):
+squeue every 60 s, sacct every 5 min - sacct is slow and hits the accounting DB.
+All dashboards share one cache (~/.claude/dash/slurm.json) behind a lock file,
+so two monitors do not mean two pollers. Fetching runs in a thread; the pane
+keeps redrawing from the cache meanwhile.
+"""
+import json, os, re, shutil, subprocess, sys, tempfile, threading, time
+from pathlib import Path
+
+HOST, USER = "cluster", "user"
+SQUEUE_EVERY, SACCT_EVERY = 60, 300
+DASH = Path.home() / ".claude" / "dash"
+CACHE, LOCK = DASH / "slurm.json", DASH / "slurm.lock"
+DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+GREEN, YELLOW, RED, CYAN = "\033[32m", "\033[33m", "\033[31m", "\033[36m"
+BAD = ("FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL", "DEADLINE", "PREEMPTED")
+
+
+def read_cache():
+    try:
+        return json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def fetch():
+    """Refresh whatever is stale. One ssh call; at most one fetcher at a time across panels."""
+    cache, now = read_cache(), time.time()
+    want_q = now - cache.get("squeue_at", 0) > SQUEUE_EVERY
+    want_a = now - cache.get("sacct_at", 0) > SACCT_EVERY
+    if not (want_q or want_a):
+        return
+    DASH.mkdir(parents=True, exist_ok=True)
+    try:
+        if LOCK.exists() and now - LOCK.stat().st_mtime > 180:
+            LOCK.unlink()  # a fetcher died mid-flight
+        os.close(os.open(LOCK, os.O_CREAT | os.O_EXCL))
+    except OSError:
+        return
+    try:
+        parts = []
+        if want_q:
+            parts.append(f"echo @@Q; squeue -u {USER} -h -o '%i|%j|%T|%M|%l|%P|%R'")
+        if want_a:
+            parts.append(f"echo @@A; sacct -u {USER} -X -n -P -S now-24hours -o JobID,JobName%40,State,Elapsed,End,Partition")
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", HOST, "; ".join(parts)],
+                           capture_output=True, text=True, timeout=90)
+        if r.returncode != 0 and "@@" not in r.stdout:
+            cache["error"] = (r.stderr.strip().splitlines() or ["ssh failed"])[-1][:120]
+            cache["squeue_at"] = now - SQUEUE_EVERY + 30  # retry in 30 s, not every tick
+        else:
+            section = None
+            rows = {"Q": [], "A": []}
+            for line in r.stdout.splitlines():
+                if line.startswith("@@"):
+                    section = line[2:3]
+                elif section and "|" in line:
+                    rows[section].append(line.split("|"))
+            if want_q:
+                cache["squeue"], cache["squeue_at"] = rows["Q"], now
+            if want_a:
+                cache["sacct"], cache["sacct_at"] = rows["A"], now
+            cache["error"] = None
+    except (OSError, subprocess.SubprocessError) as e:
+        cache["error"] = f"{type(e).__name__}: cluster unreachable"
+        cache["squeue_at"] = now - SQUEUE_EVERY + 30
+    finally:
+        fd, tmp = tempfile.mkstemp(dir=DASH, prefix=".tmp-")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(cache, fh)
+        os.replace(tmp, CACHE)
+        try:
+            LOCK.unlink()
+        except OSError:
+            pass
+
+
+def clip(text, n):
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def fit(line, width):
+    """Truncate to `width` visible cells, keeping escape codes intact - a wrapped line would scroll the pane."""
+    out, seen, pos = [], 0, 0
+    for m in ANSI.finditer(line):
+        chunk = line[pos:m.start()]
+        take = max(0, min(len(chunk), width - seen))
+        out.append(chunk[:take]); seen += take
+        out.append(m.group()); pos = m.end()
+    chunk = line[pos:]
+    out.append(chunk[:max(0, width - seen)])
+    return "".join(out) + OFF
+
+
+def render():
+    cols, height = shutil.get_terminal_size()
+    c, now = read_cache(), time.time()
+    queue = c.get("squeue") or []
+    done = [r for r in (c.get("sacct") or []) if len(r) >= 6 and not r[2].startswith(("RUNNING", "PENDING"))]
+    done.sort(key=lambda r: r[4], reverse=True)   # most recent first
+    running = sum(1 for r in queue if r[2] == "RUNNING")
+    ok = sum(1 for r in done if r[2].startswith("COMPLETED"))
+    bad = sum(1 for r in done if r[2].startswith(BAD))
+    cancelled = sum(1 for r in done if r[2].startswith("CANCELLED"))
+    age = now - c.get("squeue_at", 0) if c.get("squeue_at") else None
+    fresh = f"updated {int(age)}s ago" if age is not None and age < 3600 else "waiting for first reply…"
+    wide = cols >= 120
+    head = (f"{BOLD} HPC · SLURM{OFF}" + (f"{DIM}  {USER}@{HOST}{OFF}" if wide else "") + f"   {CYAN}▶ {running} running{OFF} · "
+            f"{YELLOW}◷ {len(queue) - running} queued{OFF}   {DIM}24h:{OFF} {GREEN}✔ {ok}{OFF}  "
+            f"{RED if bad else DIM}✘ {bad}{OFF}  {DIM}⊘ {cancelled}" + (" cancelled" if wide else "") + f"   {fresh}{OFF}")
+    out = [head]
+    if c.get("error"):
+        out.append(f" {RED}{clip(c['error'], cols - 2)}{OFF}")
+        out.append(f"{DIM} showing the last good data · `ssh {HOST}` once in any window re-opens the connection{OFF}")
+    name_w = max(10, min(36, cols - (70 if cols >= 100 else 58)))
+    show_part = cols >= 100   # partition column only when there is room
+    for r in sorted(queue, key=lambda r: (r[2] != "RUNNING", r[0])):
+        jid, name, state, used, limit, part, why = (r + [""] * 7)[:7]
+        colour = CYAN if state == "RUNNING" else YELLOW
+        out.append(f" {colour}{'▶' if state == 'RUNNING' else '◷'} {jid:<9}{OFF} {clip(name, name_w):<{name_w}} "
+                   f"{colour}{state.lower():<10}{OFF} {used:>10} / {limit:<11} {DIM}" + (f"{clip(part, 18):<18} " if show_part else "") + f"{clip(why, 24)}{OFF}")
+    if not queue and not c.get("error"):
+        out.append(f"{DIM}   nothing running or queued{OFF}")
+    for r in done:
+        jid, name, state, elapsed, end, part = r[:6]
+        word = state.split()[0]
+        colour, mark = (GREEN, "✔") if word == "COMPLETED" else (RED, "✘") if word in BAD else (DIM, "⊘")
+        when = end[11:16] if end[:10] == time.strftime("%Y-%m-%d") else end[5:16].replace("T", " ")
+        out.append(f" {colour}{mark} {jid:<9}{OFF} {clip(name, name_w):<{name_w}} {colour}{word.lower():<10}{OFF} "
+                   f"{elapsed:>10}   {DIM}ended {when:<11}" + (f" {clip(part, 18)}" if show_part else "") + OFF)
+    hidden = len(out) - height
+    if hidden > 0:
+        out = out[:height - 1] + [f"{DIM}   … {hidden + 1} more finished jobs in the last 24 h{OFF}"]
+    out = [fit(l, cols - 1) for l in out]
+    return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
+
+
+if "--once" in sys.argv:
+    fetch()
+    print(render())
+    sys.exit(0)
+sys.stdout.write("\033[?25l\033[2J")
+try:
+    while True:
+        if not any(t.name == "fetch" for t in threading.enumerate()):
+            threading.Thread(target=fetch, name="fetch", daemon=True).start()
+        sys.stdout.write(render())
+        sys.stdout.flush()
+        time.sleep(5)
+except KeyboardInterrupt:
+    pass
+finally:
+    sys.stdout.write("\033[?25h\n")

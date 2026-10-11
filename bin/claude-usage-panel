@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Claude usage widget for the tmux dashboard: plan limits + context per session.
+
+Reads the JSON that ~/.local/bin/claude-statusline saves for every session
+(~/.claude/dash/status/<session>.json) - the same numbers `/usage` shows.
+Idle sessions keep reporting the limits they last saw, so for each window we
+trust the newest reset time and, within it, the highest percentage (usage only
+grows inside a window).
+"""
+import json, os, re, shutil, subprocess, sys, time
+from pathlib import Path
+
+STATUS = Path.home() / ".claude" / "dash" / "status"
+REGISTRY = Path.home() / ".claude" / "sessions"
+DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+GREEN, YELLOW, RED = "\033[32m", "\033[33m", "\033[31m"
+
+
+def level(p):
+    return GREEN if p < 60 else YELLOW if p < 80 else RED
+
+
+def bar(p, width):
+    full = round(max(0.0, min(100.0, p)) / 100 * width)
+    return f"{level(p)}{'█' * full}{OFF}{DIM}{'░' * (width - full)}{OFF}"
+
+
+def span(seconds):
+    seconds = max(0, int(seconds))
+    d, h, m = seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60
+    return f"{d}d{h:02d}h" if d else f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def load():
+    out = []
+    for f in STATUS.glob("*.json"):
+        try:
+            out.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def live_windows():
+    """{session_id: tmux window index} for Claude processes that are still running."""
+    try:
+        panes = dict(l.split() for l in subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{window_index}"],
+            capture_output=True, text=True).stdout.splitlines())
+    except (OSError, ValueError):
+        panes = {}
+    live = {}
+    for f in REGISTRY.glob("*.json"):
+        try:
+            s = json.loads(f.read_text())
+            os.kill(s["pid"], 0)
+        except (OSError, ValueError, KeyError):
+            continue
+        last = max(s.get("statusUpdatedAt", 0), s.get("updatedAt", 0), s.get("startedAt", 0))
+        live[s.get("sessionId")] = (panes.get(s.get("tmux", "").rpartition(".")[2], "-"), last)
+    return live
+
+
+def limit(status, key, now):
+    best = None
+    for s in status:
+        w = (s.get("rate_limits") or {}).get(key) or {}
+        if w.get("used_percentage") is None or (w.get("resets_at") or 0) <= now:
+            continue
+        cand = (w["resets_at"], w["used_percentage"])
+        best = max(best, cand) if best else cand
+    return best
+
+
+def render():
+    cols, rows = shutil.get_terminal_size()
+    now, status, live = time.time(), load(), live_windows()
+    out = [f"{BOLD} Claude usage{OFF}{DIM}  plan limits, as in /usage{OFF}"]
+    bw = max(6, min(24, cols - 41))
+    for key, label in (("five_hour", "5-hour"), ("seven_day", "7-day ")):
+        got = limit(status, key, now)
+        if not got:
+            out.append(f" {label} {DIM}no fresh reading yet - use any session once{OFF}")
+            continue
+        resets, used = got
+        when = time.strftime("%H:%M" if resets - now < 86400 else "%a %H:%M", time.localtime(resets))
+        out.append(f" {label} {bar(used, bw)} {level(used)}{used:3.0f}%{OFF} {DIM}resets {when} ({span(resets - now)}){OFF}")
+
+    sessions = sorted(((live[s.get("session_id")][0], s) for s in status if s.get("session_id") in live),
+                      key=lambda t: -live[t[1]["session_id"]][1])   # most recently used first, like the sessions panel
+    if sessions:
+        out += ["", f"{BOLD} Context per session{OFF}{DIM}  % of window · prompt cache{OFF}"]
+        cw_bar = max(6, min(18, cols - 36))
+        for win, s in sessions:
+            cw = s.get("context_window") or {}
+            p = cw.get("used_percentage")
+            if p is None:
+                continue
+            model = re.sub(r"^Claude ", "", (s.get("model") or {}).get("display_name") or "?")[:9]
+            pc = s.get("prompt_cache") or {}
+            left = (pc.get("expires_at") or 0) - now
+            cache = f"warm {span(left)}" if pc.get("warm") and left > 0 else "cold" if pc else ""
+            out.append(f" {win:>2} {bar(p, cw_bar)} {level(p)}{p:3.0f}%{OFF} {model:<9} {DIM}{cache}{OFF}")
+        cost = sum((s.get("cost") or {}).get("total_cost_usd") or 0 for _, s in sessions)
+        out.append(f"{DIM} live sessions ≈ ${cost:,.0f} at API prices (covered by the plan){OFF}")
+    out = out[:max(rows, 1)]
+    return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
+
+
+if "--once" in sys.argv:
+    print(render())
+    sys.exit(0)
+sys.stdout.write("\033[?25l\033[2J")
+try:
+    while True:
+        sys.stdout.write(render())
+        sys.stdout.flush()
+        time.sleep(5)
+except KeyboardInterrupt:
+    pass
+finally:
+    sys.stdout.write("\033[?25h\n")

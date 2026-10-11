@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Big-digit clock for the tmux dashboard.
+
+Replaces tmux's built-in clock-mode, which quits on any keypress or click in
+its pane. Adapts to the pane: 5-row digits when there is room (with the date
+underneath if rows allow), otherwise a single text line.
+"""
+import json, shutil, sys, time
+from pathlib import Path
+
+FONT = {"0": "111101101101111", "1": "001001001001001", "2": "111001111100111", "3": "111001111001111",
+        "4": "101101111001001", "5": "111100111001111", "6": "111100111101111", "7": "111001001001001",
+        "8": "111101111101111", "9": "111101111001111", ":": "000010000010000"}
+CYAN, DIM, OFF = "\033[36m", "\033[2m", "\033[0m"
+THEME = Path.home() / ".local" / "share" / "dash-theme" / "colours.json"   # written by dash-theme
+
+
+def digit_colour():
+    """The active theme's accent as a truecolor escape; plain cyan when no theme is active."""
+    try:
+        h = json.loads(THEME.read_text())["accent"].lstrip("#")
+        return "\033[38;2;%d;%d;%dm" % (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except (OSError, ValueError, KeyError, IndexError):
+        return CYAN
+
+
+def big(text):
+    rows = []
+    for r in range(5):
+        cells = []
+        for ch in text:
+            bits = FONT[ch][r * 3:r * 3 + 3]
+            if ch == ":":
+                bits = bits[1]  # the colon is one cell wide, so HH:MM fits a 32-column pane
+            cells.append("".join("██" if b == "1" else "  " for b in bits))
+        rows.append(" ".join(cells))
+    return rows
+
+
+def render():
+    cols, rows = shutil.get_terminal_size()
+    now = time.localtime()
+    date = time.strftime("%a %d %b %Y", now)
+    digits = big(time.strftime("%H:%M", now))
+    colour = digit_colour()
+    if rows >= 5 and cols >= len(digits[0]) + 2:
+        body = [f"{colour}{l.center(cols - 1)}{OFF}" for l in digits]
+        if rows >= 7:
+            body += ["", f"{DIM}{date.center(cols - 1)}{OFF}"]
+    else:
+        body = [f"{colour}{time.strftime('%H:%M', now).center(cols - 1)}{OFF}", f"{DIM}{date.center(cols - 1)}{OFF}"][:rows]
+    pad = max((rows - len(body)) // 2, 0)
+    out = [""] * pad + body
+    return "\033[H" + "".join(l + "\033[K\n" for l in out[:rows]).rstrip("\n") + "\033[J"
+
+
+if "--once" in sys.argv:
+    print(render())
+    sys.exit(0)
+sys.stdout.write("\033[?25l\033[2J")
+try:
+    while True:
+        sys.stdout.write(render())
+        sys.stdout.flush()
+        time.sleep(1)
+except KeyboardInterrupt:
+    pass
+finally:
+    sys.stdout.write("\033[?25h\n")

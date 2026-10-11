@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Live panel of running Claude Code sessions, for the tmux dashboard window.
+
+Joins ~/.claude/sessions/<pid>.json (status, session id) with tmux panes
+(window number, pane title = Claude's own topic summary).
+"""
+import json, os, re, shutil, subprocess, sys, time
+from pathlib import Path
+
+REGISTRY = Path.home() / ".claude" / "sessions"
+SNAPSHOT = Path.home() / ".tmux-claude-restore.sh"
+SEP = "\x1f"
+DOT = {"busy": "\033[33m●\033[0m", "idle": "\033[32m●\033[0m", "shell": "\033[36m●\033[0m"}
+DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+
+
+def ago(seconds):
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit}"
+    return "now"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def tmux_panes():
+    fmt = SEP.join(["#{pane_id}", "#{session_name}", "#{window_index}", "#{pane_title}"])
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
+                             capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    return {p[0]: p[1:] for p in (l.split(SEP) for l in out.splitlines())}
+
+
+def rows():
+    panes, now = tmux_panes(), time.time()
+    for f in REGISTRY.glob("*.json"):
+        try:
+            s = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not alive(s.get("pid", -1)):
+            continue
+        pane = panes.get(s.get("tmux", "").rpartition(".")[2])
+        if pane:
+            where, title = f"{pane[1]:>2}", re.sub(r"^[^\w(]\s+", "", pane[2]).strip()
+        else:
+            where, title = " -", f"({s.get('entrypoint', '?')}) {s.get('name', '')}"
+        status = s.get("status", "?")
+        last = max(s.get("statusUpdatedAt", 0), s.get("updatedAt", 0), s.get("startedAt", 0)) / 1000
+        idle_for = now - (last or now)
+        yield (-last,), where, status, title or Path(s.get("cwd", "")).name, ago(idle_for)   # most recently used first
+
+
+def render():
+    cols, height = shutil.get_terminal_size()
+    data = sorted(rows())
+    busy = sum(1 for r in data if r[2] == "busy")
+    out = [f"{BOLD} Claude sessions{OFF}  {len(data)} running, {busy} busy", ""]
+    room = max(min(cols - 12, 72), 8)  # keep the age column near the title on very wide panes
+    for _, where, status, title, age in data:
+        if len(title) > room:
+            title = title[:room - 1] + "…"
+        out.append(f" {where} {DOT.get(status, '○')} {title:<{room}} {DIM}{age:>4}{OFF}")
+    out.append("")
+    if SNAPSHOT.exists():
+        n = SNAPSHOT.read_text().count("claude --resume")
+        out.append(f"{DIM} snapshot: {n} sessions, {ago(time.time() - SNAPSHOT.stat().st_mtime)}{'' if time.time() - SNAPSHOT.stat().st_mtime < 60 else ' ago'}"
+                   f" (tmux-claude-save){OFF}")
+    out.append(f"{DIM} {DOT['busy']}{DIM} busy  {DOT['idle']}{DIM} idle  {DOT['shell']}{DIM} idle, background shell open{OFF}")
+    out = out[:max(height - 1, 1)]  # never scroll the pane: clip to its height
+    return "\033[H" + "".join(l + "\033[K\n" for l in out) + "\033[J"
+
+
+if "--once" in sys.argv:
+    sys.stdout.write(render())
+    sys.exit(0)
+sys.stdout.write("\033[?25l\033[2J")
+try:
+    while True:
+        sys.stdout.write(render())
+        sys.stdout.flush()
+        time.sleep(3)
+except KeyboardInterrupt:
+    pass
+finally:
+    sys.stdout.write("\033[?25h\n")

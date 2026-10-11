@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Spotify now-playing widget for the tmux dashboard, with playback keys.
+
+Talks to the Spotify desktop app through AppleScript (what the tmux-spotify
+plugins do), polling every 3 s and ticking the progress bar locally in between.
+Never launches Spotify: if the app is closed the widget just says so.
+Keys, when this pane has focus:  space play/pause · n next · p previous · + / - volume
+"""
+import os, select, shutil, subprocess, sys, termios, time, tty
+
+POLL = 3.0
+DIM, BOLD, OFF, GREEN = "\033[2m", "\033[1m", "\033[0m", "\033[32m"
+QUERY = '''if application "Spotify" is running then
+  tell application "Spotify"
+    set s to player state as string
+    if s is "stopped" then return "stopped"
+    return s & "\\t" & (name of current track) & "\\t" & (artist of current track) & "\\t" & (album of current track) & "\\t" & (duration of current track) & "\\t" & (player position) & "\\t" & (sound volume)
+  end tell
+else
+  return "closed"
+end if'''
+KEYS = {" ": "playpause", "n": "next track", "p": "previous track"}
+
+
+def osa(script):
+    try:
+        return subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=8).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def tell(command):
+    osa(f'if application "Spotify" is running then tell application "Spotify" to {command}')
+
+
+def poll():
+    parts = osa(QUERY).split("\t")
+    if len(parts) < 7:
+        return {"state": parts[0] or "unavailable"}
+    try:
+        return {"state": parts[0], "title": parts[1], "artist": parts[2], "album": parts[3],
+                "duration": float(parts[4]) / 1000, "position": float(parts[5].replace(",", ".")),
+                "volume": int(float(parts[6])), "at": time.time()}
+    except ValueError:
+        return {"state": "unavailable"}
+
+
+def clip(text, n):
+    return text if len(text) <= n else text[:max(n - 1, 1)] + "…"
+
+
+def mmss(seconds):
+    return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
+
+
+def render(s):
+    cols, rows = shutil.get_terminal_size()
+    w = max(cols - 2, 10)
+    if s["state"] in ("closed", "stopped", "unavailable"):
+        msg = {"closed": "Spotify is not open", "stopped": "nothing playing"}.get(s["state"], "Spotify not responding")
+        out = [f"{BOLD} ♫ Spotify{OFF}", f"{DIM} {msg}{OFF}"]
+    else:
+        playing = s["state"] == "playing"
+        pos = min(s["duration"], s["position"] + (time.time() - s["at"] if playing else 0))
+        bar_w = max(w - 12, 6)
+        full = round(pos / s["duration"] * bar_w) if s["duration"] else 0
+        bar = f"{GREEN}{'━' * full}{OFF}{DIM}{'─' * (bar_w - full)}{OFF}"
+        out = [f" {GREEN}{'▶' if playing else '⏸'}{OFF} {BOLD}{clip(s['title'], w - 2)}{OFF}",
+               f"{DIM}   {clip(s['artist'] + ' — ' + s['album'], w - 2)}{OFF}",
+               f" {mmss(pos):>5} {bar} {mmss(s['duration'])}",
+               f"{DIM} {clip(('space ⏯  n ⏭  p ⏮  +/- vol ' if w >= 36 else '␣ n p +/-  vol ') + str(s['volume']) + '%', w)}{OFF}"]
+    if len(out) == 4 and rows < 4:                 # short pane: keep title + progress bar, then artist
+        out = [out[0], out[2]] if rows < 3 else [out[0], out[1], out[2]]
+    out = out[:max(rows, 1)]
+    return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
+
+
+if "--once" in sys.argv:
+    print(render(poll()))
+    sys.exit(0)
+
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd) if os.isatty(fd) else None
+sys.stdout.write("\033[?25l\033[2J")
+try:
+    if saved:
+        tty.setcbreak(fd)
+    state, last = poll(), time.time()
+    while True:
+        sys.stdout.write(render(state))
+        sys.stdout.flush()
+        ready = select.select([fd], [], [], 1.0)[0] if saved else (time.sleep(1.0) or [])
+        if ready:
+            key = os.read(fd, 1).decode(errors="ignore")
+            if not key:
+                continue
+            if key in KEYS:
+                tell(KEYS[key])
+            elif key in "+=" and "volume" in state:
+                tell(f"set sound volume to {min(100, round(state['volume'] / 10) * 10 + 10)}")
+            elif key in "-_" and "volume" in state:
+                tell(f"set sound volume to {max(0, round(state['volume'] / 10) * 10 - 10)}")
+            else:
+                continue
+            time.sleep(0.3)  # let Spotify settle before re-reading
+            state, last = poll(), time.time()
+        elif time.time() - last >= POLL:
+            state, last = poll(), time.time()
+except KeyboardInterrupt:
+    pass
+finally:
+    if saved:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    sys.stdout.write("\033[?25h\n")
