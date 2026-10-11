@@ -27,6 +27,7 @@ ROLES = ["dash-btop", "slurm-panel", "claude-sessions-panel", "claude-usage-pane
          "clock-panel", "weather-panel", "spotify-panel", "local-jobs-panel"]   # pane order the layouts assume
 SENSORS_H, CLOCK_H = 10, 7   # rows the widgets need
 PANEL_W = (56, 64)           # min / max width of the right-hand column in wide mode
+BTOP_MIN_H = 24             # btop 1.4.7 refuses to draw below 80x24
 TALL_BELOW = 2.0             # width/height under this (cells are ~2x taller than wide) = portrait
 
 
@@ -53,12 +54,21 @@ def wide(W, H, p):
     if jobs:
         slurm = max(6, slurm - 3)
     btop = H - slurm - jobs_h - (2 if jobs else 1)
+    side = bool(jobs) and btop < BTOP_MIN_H      # short screen: SLURM and local jobs share one row so btop keeps its 24 rows
+    if side:
+        btop = BTOP_MIN_H
+        slurm, jobs_h = H - btop - 1, 0
     sess = H - usage - SENSORS_H - bottom - 3
     y_use, y_sens, y_bot = sess + 1, sess + usage + 2, sess + usage + SENSORS_H + 3
     sw = 22 if roomy else 20                      # Spotify keeps a narrow strip; clock + weather get the rest
     cw = right - sw - 1
-    jobs_cell = f",{left}x{jobs_h},0,{btop + slurm + 2},{jobs}" if jobs else ""
-    return (f"{W}x{H},0,0{{{left}x{H},0,0[{left}x{btop},0,0,{p[0]},{left}x{slurm},0,{btop + 1},{p[1]}{jobs_cell}],"
+    jobs_cell = f",{left}x{jobs_h},0,{btop + slurm + 2},{jobs}" if jobs and not side else ""
+    slurm_cell = f"{left}x{slurm},0,{btop + 1},{p[1]}"
+    if side:
+        jw = 24
+        slurm_cell = (f"{left}x{slurm},0,{btop + 1}{{{left - jw - 1}x{slurm},0,{btop + 1},{p[1]},"
+                      f"{jw}x{slurm},{left - jw},{btop + 1},{jobs}}}")
+    return (f"{W}x{H},0,0{{{left}x{H},0,0[{left}x{btop},0,0,{p[0]},{slurm_cell}{jobs_cell}],"
             f"{right}x{H},{x},0["
             f"{right}x{sess},{x},0,{p[2]},"
             f"{right}x{usage},{x},{y_use},{p[3]},"
