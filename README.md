@@ -1,15 +1,15 @@
 # tmux-dashboard
 
 A monitoring window (`dash`) for a tmux session full of Claude Code sessions, plus manual
-save/restore of those sessions across reboots. Built for one Mac (macOS) and one
-cluster (`ssh cluster`); host names, the weather location and paths are specific to it.
+save/restore of those sessions across reboots. Built on one Mac and one cluster; the machine-specific bits (cluster alias, weather location)
+live in `~/.config/tmux-dashboard/config`, so it installs on another Mac, see below.
 
 ## Layout
 
 ```
 bin/        scripts, symlinked into ~/.local/bin by install.sh
 config/     tmux.conf, symlinked to ~/.tmux.conf
-launchd/    com.tiagobrc.dash-web.plist (lock-screen web mirror)
+launchd/    dash-web.plist.in (template for the lock-screen web mirror; install.sh fills in paths)
 saver/      sources of the "Tmux Dashboard" screensaver (WKWebView -> dash-web). Parked, see below
 ```
 
@@ -65,11 +65,53 @@ window-level options, so Claude's own windows are untouched). Needs the upstream
 in the right cwd. Saving is manual by choice. Never run the restore script while the sessions are
 live: it would double-resume every conversation.
 
-## Install
+## Install on another Mac
+
+Requires macOS (Apple Silicon for `macmon`), Homebrew, Python >= 3.11 and tmux. Claude Code is needed for the
+sessions/usage panes; the SLURM pane needs an ssh alias that logs in without a password.
 
 ```
-./install.sh        # symlinks bin/* and config/tmux.conf; prints the manual steps
+git clone git@github.com:tiagobrc/tmux_dashboard_evangelion_theme.git ~/tmux-dashboard
+cd ~/tmux-dashboard
+./install.sh --check                      # report what is missing, change nothing
+./install.sh --brew --theme magi          # install deps, link everything, fetch + apply the MAGI theme
+$EDITOR ~/.config/tmux-dashboard/config   # SLURM host/user, weather location
+tmux new -s main                          # the dash window is added automatically; prefix+g jumps to it
 ```
+
+`install.sh` is idempotent and never overwrites a regular file (it is moved to `<name>.bak-<date>`).
+
+| Flag | Does |
+|---|---|
+| *(none)* | symlinks `bin/*` into `~/.local/bin` and `config/tmux.conf` into `~/.tmux.conf`; creates `~/.config/tmux-dashboard/config`; sets `statusLine` in `~/.claude/settings.json` if unset (backed up first) |
+| `--brew` | `brew bundle` from `Brewfile` (tmux, btop, macmon, python) |
+| `--theme magi\|eva01\|eva02` | clones SinsuSquid/MAGI-theme into `~/.local/share/dash-theme/` and runs `dash-theme <variant>` (backs up your tmux/btop/iTerm/VS Code configs first; `dash-theme default` reverts) |
+| `--launchd` | installs and starts the lock-screen web mirror (`dash-web`, `http://127.0.0.1:8765/`) |
+| `--check` | dry run |
+
+Make sure `~/.local/bin` is on your `PATH`.
+
+### Per-machine settings
+
+`~/.config/tmux-dashboard/config` (template: `config/dashboard.conf.example`), `KEY=VALUE`, environment variables of
+the same name win:
+
+| Key | Meaning |
+|---|---|
+| `SLURM_HOST` / `SLURM_USER` | ssh alias of the cluster login node and your user there. Empty = the SLURM pane says it is not configured |
+| `WEATHER_LAT` / `WEATHER_LON` / `WEATHER_PLACE` / `WEATHER_TZ` | weather location; `WEATHER_TZ=auto` takes the zone from the coordinates |
+
+### Optional pieces
+
+- **Temperatures** in the sensors pane: drop the [iSMC](https://github.com/dkorunic/iSMC) release binary at
+  `~/.local/bin/ismc`. Without it the pane shows macmon data only.
+- **Spotify** pane: needs the Spotify desktop app; otherwise it idles.
+- **Screensaver** (`saver/`): parked, not installed by `install.sh`.
+
+### Updating
+
+`git pull` is enough: scripts are symlinks. Re-run `./install.sh` after new scripts are added, then
+`tmux source-file ~/.tmux.conf`.
 
 ## Known issues
 

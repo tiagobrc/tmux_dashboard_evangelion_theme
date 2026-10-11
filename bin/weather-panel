@@ -1,14 +1,31 @@
 #!/usr/bin/env python3
 """Weather widget for the tmux dashboard: now + next days, Open-Meteo (free, no key).
 
-Location is NYC; edit LAT/LON/PLACE below. Refreshes every
+Location comes from WEATHER_LAT/LON/PLACE/TZ in ~/.config/tmux-dashboard/config (default: NYC). Refreshes every
 15 min and shares one cache file between dashboards, so several panes = one request.
 Adapts to the pane: 2 rows = now + tomorrow, 3 rows = now + 3-day strip, 4+ rows = one day per line.
 """
 import json, os, re, shutil, signal, sys, tempfile, time, urllib.request
 from pathlib import Path
 
-LAT, LON, PLACE, TZ = 40.7128, -74.0060, "NYC", "America/New_York"
+
+
+def conf(key, default=""):
+    """KEY=VALUE from ~/.config/tmux-dashboard/config (environment wins); written by install.sh."""
+    if key in os.environ:
+        return os.environ[key]
+    try:
+        for line in (Path.home() / ".config" / "tmux-dashboard" / "config").read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == key and not line.lstrip().startswith("#"):
+                return v.strip().strip("\"'")
+    except OSError:
+        pass
+    return default
+
+
+LAT, LON = conf("WEATHER_LAT", "40.7128"), conf("WEATHER_LON", "-74.0060")
+PLACE, TZ = conf("WEATHER_PLACE", "NYC"), conf("WEATHER_TZ", "auto")
 EVERY = 15 * 60
 CACHE = Path.home() / ".claude" / "dash" / "weather.json"
 URL = (f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"

@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.tiagobrc.dash-web</string>
+    <string>local.tmux-dashboard.web</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/python3</string>
-        <string>/Users/you/.local/bin/dash-web</string>
+        <string>@BREW@/bin/python3</string>
+        <string>@HOME@/.local/bin/dash-web</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>@BREW@/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -21,6 +21,6 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>StandardErrorPath</key>
-    <string>/Users/you/.claude/dash/dash-web.log</string>
+    <string>@HOME@/.claude/dash/dash-web.log</string>
 </dict>
 </plist>

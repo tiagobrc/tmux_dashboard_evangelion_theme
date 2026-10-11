@@ -10,7 +10,23 @@ keeps redrawing from the cache meanwhile.
 import json, os, re, shutil, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
-HOST, USER = "cluster", "user"
+
+
+def conf(key, default=""):
+    """KEY=VALUE from ~/.config/tmux-dashboard/config (environment wins); written by install.sh."""
+    if key in os.environ:
+        return os.environ[key]
+    try:
+        for line in (Path.home() / ".config" / "tmux-dashboard" / "config").read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == key and not line.lstrip().startswith("#"):
+                return v.strip().strip("\"'")
+    except OSError:
+        pass
+    return default
+
+
+HOST, USER = conf("SLURM_HOST"), conf("SLURM_USER")
 SQUEUE_EVERY, SACCT_EVERY = 60, 300
 DASH = Path.home() / ".claude" / "dash"
 CACHE, LOCK = DASH / "slurm.json", DASH / "slurm.lock"
@@ -141,6 +157,12 @@ def render():
     return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
 
 
+if not HOST or not USER:
+    sys.stdout.write("\033[2J\033[H SLURM: set SLURM_HOST and SLURM_USER in ~/.config/tmux-dashboard/config")
+    sys.stdout.flush()
+    while "--once" not in sys.argv:
+        time.sleep(3600)
+    sys.exit(0)
 if "--once" in sys.argv:
     fetch()
     print(render())

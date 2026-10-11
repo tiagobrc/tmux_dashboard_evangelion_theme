@@ -1,0 +1,13 @@
+# ~/.config/tmux-dashboard/config - per-machine settings, read by the panels. install.sh creates it.
+# KEY=VALUE, no spaces around "=". Environment variables of the same name win.
+
+# SLURM pane: an ssh alias (from ~/.ssh/config) that reaches the login node without a password.
+# Leave SLURM_HOST empty and the pane just says it is not configured.
+SLURM_HOST=
+SLURM_USER=
+
+# Weather pane (Open-Meteo, no key). TZ=auto lets Open-Meteo pick the zone from the coordinates.
+WEATHER_LAT=40.7128
+WEATHER_LON=-74.0060
+WEATHER_PLACE=NYC
+WEATHER_TZ=auto
