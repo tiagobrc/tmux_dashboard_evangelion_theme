@@ -33,8 +33,9 @@ tall (portrait), re-run by a `window-resized` hook. Panes are found by the comma
 (`ROLES` in that script), then swapped into the order tmux fills a custom layout in; tmux ignores
 the ids inside a layout string.
 
-Panes ignore keystrokes (`select-pane -d`) so a stray key cannot quit btop; `prefix+i` toggles input.
-The local-jobs pane is the exception. A dead widget is respawned by a `pane-died` hook.
+Every pane ignores keystrokes (`select-pane -d`) so a stray key cannot quit btop, pause Spotify or change
+the local-jobs sort; `prefix+i` toggles input for the pane under the cursor. A dead widget is respawned by a
+`pane-died` hook.
 
 ## Local jobs pane
 

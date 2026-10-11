@@ -36,7 +36,7 @@ tmux split-window -h -d -t "$clock" -c "$HOME" spotify-panel   # last in pane or
 tmux split-window -v -d -t "$clock" -c "$HOME" weather-panel   # under the clock: between clock and Spotify in pane order
 tmux split-window -v -d -t "$main" -c "$HOME" local-jobs-panel   # panes are matched by command, so position here is free
 tmux set-option -w -t "$win" remain-on-exit on          # a crashed widget leaves a dead pane, which the pane-died hook respawns
-for p in $(tmux list-panes -t "$win" -F '#{pane_id} #{pane_start_command}' | grep -v local-jobs-panel | cut -d' ' -f1); do tmux select-pane -d -t "$p"; done   # local-jobs keeps input: s/f/r sort+filter   # panes ignore keystrokes; prefix+i re-enables one
+for p in $(tmux list-panes -t "$win" -F '#{pane_id}'); do tmux select-pane -d -t "$p"; done   # prefix+i re-enables one (local-jobs: s/f/r sort+filter)   # panes ignore keystrokes; prefix+i re-enables one
 tmux select-pane -t "$main"
 dash-theme style   # orange default text + tinted selected pane on this window
 tmux-dash-layout   # fit to this screen: wide (landscape) or tall (portrait); re-run by the window-resized hook
