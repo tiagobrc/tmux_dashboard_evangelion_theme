@@ -15,9 +15,12 @@ response once, subagents included - claude_sessions, counted in a background thr
   top today $45 w12 Gen022830 qPCR prim…  today's costliest session
   warm now: 2 sessions, $.27/step         what one more step of every warm session costs
   cache misses, open sessions: …          tokens the running sessions re-sent on cache misses, and why
+  spend index 7.1 MB per process · …      what counting the spend takes in memory (each panel that shows spend holds
+                                          its own copy), the index file, and the responses of the last hour, which
+                                          are kept whole until their transcript is summed
 
 As many lines as the pane has rows for, in that order of importance (59x3: the bars and the month only); a tall pane
-also gets the 7 days as bars.
+also gets the 7 days as bars, and the index line last of all.
 
 Budget alert: with MONTH_BUDGET_USD set, one tmux message to the clients of this panel's tmux session when the month to
 date passes 80% and 100% of it - once per month and threshold across every dashboard (a marker in
@@ -247,6 +250,19 @@ def miss_line(width):
                 f"{GREY} cache misses:{OFF} {tokens(toks)} re-sent, {usd(cost)}"], width)
 
 
+def index_line(width):
+    """What the spend index takes in this process (every panel that shows spend holds its own), and on disk."""
+    s = _data.get("index")
+    if not s:
+        return None
+    mb = lambda b: f"{b / 1e6:.1f} MB"
+    live = f"{s['live'] / 1e3:.1f}k" if s["live"] >= 1000 else str(s["live"])
+    base = f"{GREY} spend index{OFF} {mb(s['mem'])}{GREY} per process"
+    return fit([f"{base} · file {mb(s['file'])} · {live} responses not yet summed{OFF}",
+                f"{base} · file {mb(s['file'])} · {live} not summed{OFF}", f"{base} · file {mb(s['file'])}{OFF}",
+                f"{base}{OFF}", f"{GREY} spend index{OFF} {mb(s['mem'])}"], width)
+
+
 def chart_lines(width, bw):
     """The 7 days as bars lined up with the limit bars, for tall panes."""
     d = _data.get("days")
@@ -267,11 +283,11 @@ def render():
     head = fit([f"{BOLD} Claude usage{OFF}{GREY}  limits as in /usage · $ at API prices{OFF}",
                 f"{BOLD} Claude usage{OFF}{GREY}  as in /usage{OFF}", f"{BOLD} Claude usage{OFF}"], width)
     days = day_lines(width)
-    misses = miss_line(width)
+    misses, index = miss_line(width), index_line(width)
     # (importance, position, lines): kept by importance while they fit, drawn by position
     blocks = [(0, 1, limits[:1]), (1, 2, limits[1:]), (2, 3, [month_line(width)]), (3, 0, [head]),
               (4, 4, days[:1]), (5, 5, days[1:]), (6, 6, [warm_line(width, now, tint)]),
-              (7, 7, [misses] if misses else []), (8, 8, chart_lines(width, bw))]
+              (7, 7, [misses] if misses else []), (8, 8, chart_lines(width, bw)), (9, 9, [index] if index else [])]
     room, keep = height, []
     for rank, pos, lines in sorted(blocks):
         if lines and len(lines) <= room:
@@ -299,7 +315,8 @@ def count(full=True):
     got = {"by": cs.spend(), "budget": cs.budget()}
     if full:
         rows = cs.build()
-        got.update(days=cs.spend_days(rows), rows={r["id"]: r for r in rows}, here=my_session())
+        got.update(days=cs.spend_days(rows), rows={r["id"]: r for r in rows}, here=my_session(),
+                   index=cs.spend_index_size())
     return got
 
 

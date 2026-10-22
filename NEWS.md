@@ -1,5 +1,22 @@
 # tmux-dashboard news
 
+## 2026-10-22: spend index size, a shorter README, screenshots
+
+- **Spend index size.** The usage pane's last line shows what counting spend takes:
+  `spend index 7.1 MB per process · file 1.0 MB · 6.8k responses not yet summed`.
+  - The memory is measured by walking the index's objects (`claude_sessions.spend_index_size()`). It matches
+    tracemalloc to 0.01 MB, takes 27 ms, and is redone only after the index changed.
+  - Each process that shows spend holds its own copy: the sessions pane, the usage pane and the browser, per
+    dashboard.
+- **README.** It is rewritten as short sections, tables and one-line bullets. The internals moved to
+  `docs/how-it-works.md`.
+- **Screenshots.** `demo/make-screenshots` makes them in about 100 s, from a sandbox with made-up data.
+  - The sessions, jobs, SLURM queue and music are invented, under a fake HOME and a private tmux server
+    (`tmux -L dashdemo`). `ssh` and `osascript` are stubbed, so the cluster and Spotify are never contacted.
+  - btop shows only cpu and memory: its process list would show real command lines, and its net box the IP address.
+  - It refuses to write a frame showing your user name or home folder.
+  - It needs Google Chrome, and installs pyte into a venv in its work folder.
+
 ## 2026-10-22: spend index v3, sums instead of every response
 
 - **What changed.** A transcript left unwritten for an hour (`FREEZE_AFTER`) is folded into token sums by day and

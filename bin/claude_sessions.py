@@ -545,6 +545,7 @@ _sp = {"files": None, "sig": None, "ahead": 0, "dirty": False, "gen": 0, "fgen":
        "stale": set(), "best": None, "best_gen": -1, "agg": None, "agg_gen": -1,
        "G": array("Q")}               # sorted hashes of the responses that some frozen transcript counts in its "g"
 _sp_lock = threading.RLock()          # the usage panel counts in a thread while it draws
+_size = {"gen": None}                 # spend_index_size()'s last measurement
 LONG = "|long"                        # model key of frozen sums priced at the LONG_PRICES tier
 
 
@@ -996,6 +997,34 @@ def spend():
         for model, day, t, cost, sids in _best().values():
             by[day[:7]] = by.get(day[:7], 0) + cost
     return by
+
+
+def spend_index_size():
+    """What the spend index costs: {"mem": bytes this process holds for it (the entries, the response table and the
+    totals), "file": bytes of SPEND, "live": responses not yet frozen, "frozen": transcripts frozen, "files": all of
+    them}; None before the first count. Measured by walking the objects, again only after the index changed."""
+    with _sp_lock:
+        files = _sp["files"]
+        if files is None:
+            return None
+        gen = (_sp["gen"], _sp["fgen"])
+        if _size["gen"] != gen:
+            seen, todo, mem = set(), [_sp], 0
+            while todo:
+                o = todo.pop()
+                if id(o) in seen:
+                    continue
+                seen.add(id(o))
+                mem += sys.getsizeof(o)
+                if isinstance(o, dict):
+                    todo.extend(o.keys())
+                    todo.extend(o.values())
+                elif isinstance(o, (list, tuple, set, frozenset)):
+                    todo.extend(o)
+            _size.update(gen=gen, mem=mem, live=sum(len(c["ids"]) for c in files.values()),
+                         frozen=sum("s" in c for c in files.values()), files=len(files))
+        sig = _sig(SPEND)
+        return {k: _size[k] for k in ("mem", "live", "frozen", "files")} | {"file": sig[2] if sig else 0}
 
 
 def spend_by_session(found=None):

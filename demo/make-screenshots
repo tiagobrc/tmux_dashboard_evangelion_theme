@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""The README screenshots, from a demo with made-up data: docs/img/dashboard.png, session-browser.png and
+dashboard-narrow.png.
+
+Everything happens in a work folder (a new temp folder, or --work DIR):
+  - a fake HOME holding invented Claude sessions (transcripts, handoff notes, rate limits, running processes), SLURM
+    jobs and a Spotify track. Only the theme files (~/.tmux/theme.conf, ~/.local/share/dash-theme, ~/.config/btop)
+    are copied in from the real home, so the colours match. Nothing in the real ~/.claude or ~/.config is written;
+  - a private tmux server, `tmux -L dashdemo`, whose panes all see that HOME. The default tmux server is never touched;
+  - stubs for `ssh` (canned squeue / sacct: nothing reaches the cluster) and `osascript` (a fixed track: the real
+    Spotify is never asked or controlled). btop shows cpu and memory only: its process list would show real command
+    lines, its net box the machine's IP address. The machine's load, its sensors and the weather (Tokyo, Open-Meteo)
+    are live.
+A tmux client is attached in a pseudo-terminal, its output fed to pyte (a terminal emulator, installed into a venv in
+the work folder when it is missing), and the screen drawn as HTML, then as PNG by headless Chrome. A frame that shows
+your user name or home folder is not written.
+
+usage: demo/make-screenshots [--work DIR] [--out DIR] [--keep]   (--keep: leave the demo server running to look at it,
+       `tmux -L dashdemo attach`, then `tmux -L dashdemo kill-server`)
+"""
+import argparse, fcntl, hashlib, html, json, os, pty, pwd, re, select, shutil, signal, struct, subprocess, sys
+import tempfile, termios, time, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SOCKET = "dashdemo"
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+FONT_PX, ADVANCE = 14, 0.60205                            # Menlo: every glyph is 0.60205 em wide
+LINE_PX = 17
+SHAPES = {"\ue0b0": "polygon(0 0,100% 50%,0 100%)", "\ue0b2": "polygon(100% 0,0 50%,100% 100%)"}   # powerline arrows
+SCALE = 1                                                 # 200 columns are 1687 px: already 2x a README's width
+# (title, folder under HOME ("" = HOME), model, context K, $ spent, minutes since the last step, days it ran, running);
+# running = (registry status, the jobs its process runs) for sessions open in a tmux window. Experiment codes end in 30
+# (2030), so none of them is a real one.
+OPUS, SONNET = "claude-opus-5-5", "claude-sonnet-5-5"
+SESSIONS = [
+    ("Genotyping plate map for litter 12", "Lab/Gen101830", OPUS, 186, 96, 25, 1.5, ("idle", None)),
+    ("Flow panel compensation, spleen B cells", "Lab/Exp101530", OPUS, 268, 182, 1, 3, ("busy", "flow")),
+    ("cellranger run on the demo dataset", "Lab/Seq101930", OPUS, 132, 64, 12, 0.6, ("idle", "seq")),
+    ("tmux dashboard colour tweaks", "", SONNET, 96, 9, 190, 2, ("idle", None)),
+    ("VDJ clonotype sharing across mice", "Lab/Exp100630", OPUS, 520, 338, 1500, 9, ("idle", None)),
+    ("scRNA QC thresholds for sample set A", "Lab/Exp092930", OPUS, 431, 262, 4300, 6, None),
+    ("AAV pup genotyping primers", "Lab/Gen100830", OPUS, 154, 61, 2900, 3, None),
+    ("Gel image band calling", "Lab/Gen092230", OPUS, 61, 24, 13000, 2, None),
+    ("Germinal center timecourse plots", "Lab/Exp091530", OPUS, 212, 205, 17000, 20, None),
+    ("Cytometry panel titration", "Lab/Cyt100130", OPUS, 74, 71, 29000, 4, None),
+    ("Plasmid map check before ordering", "Lab/Seq092530", SONNET, 45, 9, 37000, 1, None),
+    ("Retreat abstract draft", "", OPUS, 38, 12, 7200, 1, None),
+    ("HPC storage quota check", "", SONNET, 22, 2, 5800, 0.2, None),
+    ("Mouse colony census numbers", "Documents/colony", OPUS, 52, 15, 8600, 1, None),
+    ("Benchmark: summarise 20 papers", ".claude/tests/bench1", OPUS, 30, 3, 10100, 0.1, None),
+    ("Lineage tree figure for lab meeting", "Lab/Exp090830", OPUS, 388, 640, 47500, 12, None),
+    ("Sequencing run QC report", "Lab/Seq091030", OPUS, 301, 530, 44600, 8, None),
+    ("Primer database cleanup", "Lab/Gen090330", OPUS, 176, 310, 51800, 6, None),
+]
+PROMPTS = {"Genotyping plate map for litter 12": ("Lay out plate 2 for litter 12: 24 pups, 3 primer sets",
+                                                    "Add the no-template controls to column 12"),
+           "scRNA QC thresholds for sample set A": ("Suggest QC cutoffs for sample set A",
+                                                      "Compare 10% and 15% mitochondrial cutoffs")}
+NOTES = {   # title -> (hours since the note was written, parked, next step)
+    "Genotyping plate map for litter 12": (2, False, "Print the bench card and load plate 2 (columns 7-12 still empty)"),
+    "scRNA QC thresholds for sample set A": (74, True, "Pick the mitochondrial-read cutoff (10% or 15%), rerun QC on set A"),
+}
+JOBS = {   # what a running session's process has started: (command line, busy)
+    "flow": [("python3 compensate.py spleen_panel_demo.fcs", False)],
+    "seq": [("cellranger count --id=DemoA --transcriptome=refdata-demo", True), ("Rscript plot_qc.R --sample DemoA", False)],
+}
+SQUEUE = ["4810231|cellranger_DemoA|RUNNING|2:13:05|1-00:00:00|bigmem|node041",
+          "4810232|cellranger_DemoB|RUNNING|1:02:44|1-00:00:00|bigmem|node017",
+          "4810240|star_align_demo|PENDING|0:00|12:00:00|bigmem|(Resources)"]
+SACCT = [("4809987|vdj_assemble_demo|COMPLETED|0:41:10|{d}T09:14:02|bigmem"),
+         ("4809961|fastqc_batch_demo|COMPLETED|0:12:31|{d}T08:02:40|normal"),
+         ("4809955|igblast_demo|FAILED|0:00:43|{d}T07:51:09|normal"),
+         ("4809902|mixcr_demo|CANCELLED by 0|0:05:12|{d}T06:30:55|normal")]
+TRACK = "playing\tFly Me to the Moon\tDemo Artist\tDemo Album\t225000\t83,5\t60"
+
+
+def sid_of(title):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "dashdemo/" + title))
+
+
+def iso(t):
+    return datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def responses(model, ctx_k, spent, start, last):
+    """Usage records whose context grows to ctx_k thousand tokens and whose list price adds up to about `spent`."""
+    sys.path.insert(0, str(REPO / "bin"))
+    from claude_sessions import usd
+
+    def make(n):
+        out = []
+        for i in range(n):
+            ctx = int(25_000 + (ctx_k * 1000 - 25_000) * (i + 1) / n)
+            write = ctx - 4 if i % 30 == 29 else 2500        # now and then the cache was cold: all of it re-written
+            out.append((start + (last - start) * i / max(1, n - 1), [4, 3000, 0, write, ctx - 4 - write]))
+        return out
+    probe = make(60)
+    n = max(2, round(spent / (sum(usd(model, t) for _, t in probe) / 60)))
+    return make(n)
+
+
+def transcript(path, title, cwd, model, ctx_k, spent, start, last, entry):
+    sid = path.stem
+    first, final = PROMPTS.get(title, (title, "Go on"))
+    base = {"sessionId": sid, "cwd": cwd, "entrypoint": entry}
+    lines = [dict(base, type="user", timestamp=iso(start - 20), message={"role": "user", "content": first})]
+    for i, (t, (inp, out, w5, w1, read)) in enumerate(responses(model, ctx_k, spent, start, last)):
+        lines.append(dict(base, type="assistant", timestamp=iso(t), message={
+            "id": f"msg_demo{hashlib.md5(sid.encode()).hexdigest()[:8]}{i:05d}", "model": model, "role": "assistant",
+            "content": [{"type": "text", "text": "…"}],
+            "usage": {"input_tokens": inp, "output_tokens": out, "cache_creation_input_tokens": w5 + w1,
+                      "cache_read_input_tokens": read,
+                      "cache_creation": {"ephemeral_5m_input_tokens": w5, "ephemeral_1h_input_tokens": w1}}}))
+    lines += [{"type": "last-prompt", "lastPrompt": final, "sessionId": sid},
+              {"type": "ai-title", "aiTitle": title, "sessionId": sid}]
+    path.write_text("".join(json.dumps(l, separators=(",", ":")) + "\n" for l in lines))   # compact, as Claude Code writes
+    os.utime(path, (last, last))                              # idle for an hour: the spend index sums it up
+    return lines[-3]["message"]["usage"]
+
+
+def build_home(home, now):
+    """The fake HOME: links to this repo, the theme, the config, and every invented session."""
+    for d in (".local/bin", ".local/share/dash-theme", ".tmux", ".config/tmux-dashboard", ".config/btop/themes",
+              ".claude/projects", ".claude/sessions", ".claude/handoffs", ".claude/dash/status", "Lab", "Documents/colony",
+              ".claude/tests/bench1"):
+        (home / d).mkdir(parents=True, exist_ok=True)
+    for f in (REPO / "bin").iterdir():
+        (home / ".local/bin" / f.name).symlink_to(f)
+    if (REAL_HOME / ".local/bin/ismc").exists():                  # temperatures in the sensors pane
+        (home / ".local/bin/ismc").symlink_to(REAL_HOME / ".local/bin/ismc")
+    (home / ".tmux.conf").symlink_to(REPO / "config/tmux.conf")
+    for src, dst in ((".tmux/theme.conf", ".tmux/theme.conf"), (".local/share/dash-theme/colours.json", None),
+                     (".local/share/dash-theme/paint.esc", None), (".local/share/dash-theme/active", None)):
+        if (REAL_HOME / src).exists():
+            shutil.copy(REAL_HOME / src, home / (dst or src))
+    conf = REAL_HOME / ".config/btop/btop.conf"
+    text = conf.read_text() if conf.exists() else ""
+    # no process list (real command lines), no net box (the machine's IP address), no disks (volume names)
+    for key, value in (("shown_boxes", '"cpu mem"'), ("show_disks", "false"), ("update_ms", "500")):
+        text, n = re.subn(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
+        text += "" if n else f"{key} = {value}\n"
+    (home / ".config/btop/btop.conf").write_text(text)
+    theme = home / ".local/share/dash-theme/MAGI-theme/alacritty"   # the palettes `dash-theme paint` reads
+    theme.mkdir(parents=True)
+    for f in (REAL_HOME / ".local/share/dash-theme/MAGI-theme/alacritty").glob("*.toml"):
+        shutil.copy(f, theme / f.name)
+    for f in (REAL_HOME / ".config/btop/themes").glob("*.theme"):
+        shutil.copy(f, home / ".config/btop/themes" / f.name)
+    (home / ".config/tmux-dashboard/config").write_text(
+        "SLURM_HOST=cluster\nSLURM_USER=demo\nWEATHER_LAT=35.6762\nWEATHER_LON=139.6503\nWEATHER_PLACE=Tokyo\n"
+        "WEATHER_TZ=auto\nMONTH_BUDGET_USD=2500\nNUDGE_MIN=0\nPARK_MODEL=off\n")
+    running = []
+    for title, folder, model, ctx_k, spent, ago, days, run in SESSIONS:
+        cwd = home / folder if folder else home
+        cwd.mkdir(parents=True, exist_ok=True)
+        last = now - ago * 60
+        proj = home / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+        proj.mkdir(exist_ok=True)
+        sid = sid_of(title)
+        entry = "sdk-cli" if folder.startswith(".claude/tests") else "cli"
+        u = transcript(proj / f"{sid}.jsonl", title, str(cwd), model, ctx_k, spent, last - days * 86400, last, entry)
+        if title in NOTES:
+            hours, parked, step = NOTES[title]
+            (home / ".claude/handoffs" / f"{sid}.md").write_text(
+                f"---\nsession: {sid}\ntitle: {title}\nfolder: {cwd}\nstatus: open\nnext: {step}\n"
+                + ("parked: yes\n" if parked else "")
+                + f"updated: {time.strftime('%Y-%m-%d %H:%M', time.localtime(now - hours * 3600))}\n---\n\n"
+                "## Goal\nA made-up thread for the README screenshots.\n")
+        if run:
+            missed = 1_200_000 if ctx_k > 400 else 380_000
+            (home / ".claude/dash/status" / f"{sid}.json").write_text(json.dumps({
+                "session_id": sid, "model": {"id": model}, "_saved_at": last + 5,
+                "context_window": {"current_usage": {k: u[k] for k in ("input_tokens", "output_tokens",
+                                                                     "cache_creation_input_tokens", "cache_read_input_tokens")}},
+                "prompt_cache": {"ttl": "1h", "expires_at": int(last + 3600), "recache_tokens_if_cold": ctx_k * 1000,
+                                 "miss_recache_tokens": missed, "misses": 2, "miss_causes": {"ttl_expired_1h": 2}},
+                "rate_limits": {"five_hour": {"used_percentage": 34, "resets_at": int(now + 9400)},
+                                "seven_day": {"used_percentage": 41, "resets_at": int(now + 3.3 * 86400)}}}))
+            running.append((title, sid, str(cwd), last, run))
+    return running
+
+
+def shims(d):
+    """ssh and osascript that answer from canned data: the cluster and the real Spotify are never contacted."""
+    d.mkdir(parents=True, exist_ok=True)
+    day = time.strftime("%Y-%m-%d")
+    q = "\n".join(SQUEUE)
+    a = "\n".join(r.format(d=day) for r in SACCT)
+    (d / "ssh").write_text("#!/bin/bash\n# demo stub: canned SLURM answers, never a connection\n"
+                           'for a; do [ "$a" = -O ] && exit 0; done\n[ "${!#}" = true ] && exit 0\n'
+                           f"cat <<'EOF'\n@@Q\n{q}\n@@RC 0\n@@A\n{a}\n@@RC 0\nEOF\n")
+    (d / "osascript").write_text("#!/bin/bash\n# demo stub: one fixed Spotify track, every other script does nothing\n"
+                                 f'case "$*" in *"player state"*) printf \'%s\\n\' "{TRACK}" ;; esac\nexit 0\n')
+    for f in ("ssh", "osascript"):
+        (d / f).chmod(0o755)
+
+
+def job_cmd(kind):
+    """A process for a fake Claude session: `claude` in ps, with the session's jobs as children. Each child ends when
+    its parent does (or after 15 minutes), so killing the tmux server leaves nothing behind."""
+    jobs = "".join(f'["{c}",{int(busy)}],' for c, busy in JOBS.get(kind, ()))
+    return ("exec perl -e 'my @jobs = (" + jobs + "); for my $j (@jobs) { if (!fork) { $0 = $j->[0]; my $end = time + 900; "
+            "while (getppid() != 1 && time < $end) { if ($j->[1]) { for (1 .. 3e6) {} } else { sleep 1 } } exit } } "
+            "$0 = \"claude\"; sleep 1e7'")
+
+
+class Demo:
+    def __init__(self, work):
+        self.work, self.home = work, work / "home"
+        self.env = {"HOME": str(self.home), "PATH": f"{work / 'shims'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                    "TERM": "xterm-256color", "LANG": "en_US.UTF-8", "SHELL": "/bin/bash", "USER": "demo",
+                    "LOGNAME": "demo", "TMPDIR": str(work / "tmp")}
+
+    def tmux(self, *args, check=False):
+        r = subprocess.run(["tmux", "-L", SOCKET, *args], env=self.env, capture_output=True, text=True, timeout=20)
+        if check and r.returncode:
+            sys.exit(f"tmux {' '.join(args)}: {r.stderr.strip()}")
+        return r.stdout
+
+    def start(self, now):
+        (self.work / "tmp").mkdir(exist_ok=True)
+        self.tmux("kill-server")                              # a demo server left over from an earlier run
+        running = build_home(self.home, now)
+        shims(self.work / "shims")
+        fmt = "#{window_id} #{pane_id} #{pane_pid}"
+        panes = [self.tmux("-f", str(self.home / ".tmux.conf"), "new-session", "-d", "-s", "lab", "-x", "200", "-y", "50",
+                           "-c", running[0][2], "-P", "-F", fmt, job_cmd(running[0][4][1]), check=True).split()]
+        self.tmux("set", "-as", "terminal-features", ",xterm-256color:RGB")   # #rrggbb as is: nobody answers tmux's probe
+        for _ in range(100):                                  # the session-created hook adds dash and sessions
+            names = self.tmux("list-windows", "-t", "lab", "-F", "#W").split()
+            if "dash" in names and "sessions" in names:
+                break
+            time.sleep(0.2)
+        else:
+            sys.exit("the dash and sessions windows did not appear")
+        for title, sid, cwd, last, run in running[1:]:
+            panes.append(self.tmux("new-window", "-d", "-t", "lab:", "-c", cwd, "-P", "-F", "#{window_id} #{pane_id} #{pane_pid}",
+                                   job_cmd(run[1])).split())
+        for (title, sid, cwd, last, run), (wid, pane, pid) in zip(running, panes):
+            self.tmux("select-pane", "-t", pane, "-T", f"✳ {title}")
+            ms = int(last * 1000)                             # no startedAt: the dummy process started just now
+            (self.home / ".claude/sessions" / f"{pid}.json").write_text(json.dumps({
+                "pid": int(pid), "sessionId": sid, "cwd": cwd, "kind": "interactive", "entrypoint": "cli",
+                "tmux": f"lab:{wid}.{pane}", "status": run[0], "updatedAt": ms, "statusUpdatedAt": ms}))
+
+    def stop(self):
+        self.tmux("kill-server")
+
+
+# ---- the screen: a tmux client in a pseudo-terminal, pyte, HTML, Chrome ----
+def palette(home):
+    """Terminal colours: the active dash-theme palette (iTerm SetColors escapes), else xterm's."""
+    p = dict(zip(("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"),
+                 ("000000", "cd0000", "00cd00", "cdcd00", "0000ee", "cd00cd", "00cdcd", "e5e5e5")))
+    p.update({"br_" + k: v for k, v in zip(p, ("7f7f7f", "ff0000", "00ff00", "ffff00", "5c5cff", "ff00ff", "00ffff", "ffffff"))})
+    p.update(fg="e5e5e5", bg="000000")
+    try:
+        p.update(re.findall(r"SetColors=(\w+)=([0-9a-fA-F]{6})", (home / ".local/share/dash-theme/paint.esc").read_text()))
+    except OSError:
+        pass
+    return {k: "#" + v for k, v in p.items()}
+
+
+def to_html(screen, pal):
+    names = {"brown": "yellow"}
+
+    def colour(c, default):
+        if c == "default":
+            return default
+        if re.fullmatch(r"[0-9a-fA-F]{6}", c):
+            return "#" + c
+        bright = c.startswith("bright")
+        c = names.get(c.removeprefix("bright"), c.removeprefix("bright"))
+        return pal.get(("br_" if bright else "") + c, default)
+
+    styles, rows, cw = {}, [], FONT_PX * ADVANCE
+    for y in range(screen.lines):
+        line, x, spans = screen.buffer[y], 0, []
+        while x < screen.columns:
+            ch = line[x]
+            fg, bg = colour(ch.fg, pal["fg"]), colour(ch.bg, pal["bg"])
+            if ch.reverse:
+                fg, bg = bg, fg
+            css = f"color:{fg};background:{bg}" + (";font-weight:bold" if ch.bold else "") + \
+                  (";text-decoration:underline" if ch.underscore else "")
+            cls = styles.setdefault(css, f"s{len(styles)}")
+            text = ch.data or " "
+            if text in SHAPES:                                # powerline arrows: iTerm draws them itself, Menlo has none
+                spans.append([cls, text, False, 1])
+                x += 1
+                continue
+            wide = x + 1 < screen.columns and line[x + 1].data == ""
+            if text.isascii() and spans and spans[-1][0] == cls and spans[-1][2]:
+                spans[-1][1] += text
+            else:
+                spans.append([cls, text, text.isascii(), 2 if wide else 1])
+            x += 2 if wide else 1
+        rows.append("".join(f'<span class="{c}" style="width:{(len(t) if a else n) * cw:.3f}px">'
+                            + (f'<i style="clip-path:{SHAPES[t]}"></i>' if t in SHAPES else html.escape(t)) + "</span>"
+                            for c, t, a, n in spans))
+    css = "".join(f".{c}{{{s}}}" for s, c in styles.items())
+    return (f"<!doctype html><meta charset=utf-8><style>html,body{{margin:0;background:{pal['bg']}}}"
+            f"div{{height:{LINE_PX}px;line-height:{LINE_PX}px;white-space:pre;font:{FONT_PX}px Menlo,'Apple Symbols',monospace}}"
+            f"span{{display:inline-block;height:{LINE_PX}px;overflow:visible;vertical-align:top}}"
+            f"i{{display:block;height:100%;background:currentColor}}{css}</style>"
+            + "".join(f"<div>{r}</div>" for r in rows))
+
+
+def shoot(page, png, cols, rows, work):
+    w, h = round(cols * FONT_PX * ADVANCE) + 1, rows * LINE_PX
+    subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+                    "--no-default-browser-check", f"--user-data-dir={work / 'chrome'}", f"--force-device-scale-factor={SCALE}",
+                    f"--window-size={w},{h}", f"--screenshot={png}", page.as_uri()],
+                   capture_output=True, timeout=120)
+    if not png.exists():
+        sys.exit(f"Chrome wrote no {png}")
+
+
+def private(text):
+    """The words of `text` that would give away whose machine this is."""
+    return [w for w in (str(REAL_HOME), REAL_HOME.name, pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0]) if w and w in text]
+
+
+def terminal(cols, rows):
+    """A pyte screen and a feed for it that copes with what tmux sends a modern terminal: queries (nobody answers
+    them, so they are dropped), `CSI > …` / `CSI = …` sequences (which pyte would take for plain SGR and the like), and
+    REP (repeat the last character)."""
+    import pyte
+
+    class Screen(pyte.Screen):
+        last = " "
+
+        def draw(self, data):
+            super().draw(data)
+            self.last = data[-1:] or self.last
+
+        def repeat_last(self, n=1, **_):
+            self.draw(self.last * max(1, n))
+
+        def report_device_status(self, *_, **__):
+            pass
+
+        def set_margins(self, *a, private=False, **_):
+            if not private:
+                super().set_margins(*a)
+
+        def select_graphic_rendition(self, *a, private=False, **_):
+            if not private:
+                super().select_graphic_rendition(*a)
+
+    class Stream(pyte.ByteStream):
+        csi = dict(pyte.ByteStream.csi, b="repeat_last")
+
+    screen = Screen(cols, rows)
+    stream, carry = Stream(screen), [b""]
+    skip = re.compile(rb"\x1b\[[<=>][0-9;:]*[ -/]*[@-~]")
+    partial = re.compile(rb"\x1b(\[[0-9;:?<=>]*[ -/]*)?$")
+
+    def feed(data):
+        data = carry[0] + data
+        m = partial.search(data)
+        carry[0], data = (data[m.start():], data[:m.start()]) if m else (b"", data)
+        stream.feed(skip.sub(b"", data))
+    return screen, feed
+
+
+def capture(demo, out, plan):
+    """Attach a client and follow `plan`: ("wait", s), ("tmux", args), ("size", (cols, rows)), ("snap", name)."""
+    cols, rows = plan[0][1]
+    screen, feed = terminal(cols, rows)
+    env = {k: v for k, v in demo.env.items()}
+    pid, fd = pty.fork()
+    if pid == 0:
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        os.execvpe("tmux", ["tmux", "-L", SOCKET, "attach", "-t", "lab:0"], env)
+    pal, written = palette(demo.home), []
+
+    def pump(seconds):
+        end = time.time() + seconds
+        while (left := end - time.time()) > 0:
+            if select.select([fd], [], [], min(left, 0.2))[0]:
+                try:
+                    feed(os.read(fd, 65536))
+                except OSError:
+                    return
+    try:
+        for step, arg in plan[1:]:
+            if step == "wait":
+                pump(arg)
+            elif step == "tmux":
+                demo.tmux(*arg)
+                pump(0.5)
+            elif step == "size":
+                cols, rows = arg
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                screen.resize(rows, cols)
+                pump(1)
+            elif step == "snap":
+                demo.tmux("refresh-client")
+                pump(1.5)
+                page = demo.work / f"{arg}.html"
+                page.write_text(to_html(screen, pal))
+                text = "\n".join(screen.display)
+                (demo.work / f"{arg}.txt").write_text(text)
+                leak = private(text)
+                if leak:
+                    print(f"{arg}: not written, the screen shows {leak}", file=sys.stderr)
+                    continue
+                png = out / f"{arg}.png"
+                shoot(page, png, cols, rows, demo.work)
+                written.append(png)
+    finally:
+        os.close(fd)                                          # first: a client still writing would block on a full pty
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    return written
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--work", help="work folder (default: a new temp folder)")
+    ap.add_argument("--out", default=str(REPO / "docs" / "img"))
+    ap.add_argument("--keep", action="store_true", help="leave the demo tmux server running")
+    a = ap.parse_args()
+    work = Path(a.work or tempfile.mkdtemp(prefix="dashdemo-")).resolve()
+    try:
+        import pyte  # noqa: F401
+    except ImportError:                                       # a venv in the work folder, then run again from it
+        venv = work / "venv"
+        if not (venv / "bin/python").exists():
+            subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+            subprocess.run([str(venv / "bin/pip"), "install", "-q", "pyte"], check=True)
+        os.execv(str(venv / "bin/python"), [str(venv / "bin/python"), __file__, "--work", str(work), "--out", a.out]
+                 + ["--keep"] * a.keep)
+    if not Path(CHROME).exists():
+        sys.exit(f"needs Google Chrome at {CHROME}")
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    if (work / "home").exists():
+        sys.exit(f"{work}/home exists: give a new --work folder")
+    demo = Demo(work)
+    demo.start(time.time())
+    try:
+        written = capture(demo, out, [("size", (200, 50)), ("wait", 60), ("snap", "dashboard"),
+                                      ("tmux", ("select-window", "-t", "lab:1")), ("wait", 6),
+                                      ("tmux", ("send-keys", "-t", "lab:1", "Down")), ("wait", 2), ("snap", "session-browser"),
+                                      ("size", (112, 64)), ("tmux", ("select-window", "-t", "lab:0")), ("wait", 25),
+                                      ("snap", "dashboard-narrow")])
+    finally:
+        if not a.keep:
+            demo.stop()
+    for png in written:
+        print(png)
+    print(f"work folder: {work}")
+
+
+if __name__ == "__main__":
+    main()

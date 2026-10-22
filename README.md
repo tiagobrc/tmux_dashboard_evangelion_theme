@@ -1,231 +1,291 @@
 # tmux-dashboard
 
-A monitoring window (`dash`) for a tmux session full of Claude Code sessions, plus manual
-save/restore of those sessions across reboots. Built on one Mac and one cluster; the machine-specific bits (cluster alias, weather location)
-live in `~/.config/tmux-dashboard/config`, so it installs on another Mac, see below.
+A tmux dashboard for a Mac that runs many Claude Code sessions.
 
-## Layout
+- **`dash`** (window 0) has nine panes. They show the running sessions and what they cost, plus the SLURM queue, local
+  jobs and the machine's load.
+- **`sessions`** (window 1) lists every Claude session, so you can resume one or continue its thread in a fresh session.
+- **Save / restore** brings the Claude windows back after a reboot.
 
-```
-bin/        scripts, symlinked into ~/.local/bin by install.sh
-config/     tmux.conf, symlinked to ~/.tmux.conf
-launchd/    dash-web.plist.in (template for the lock-screen web mirror; install.sh fills in paths)
-saver/      sources of the "Tmux Dashboard" screensaver (WKWebView -> dash-web). Parked, see below
-```
+![The dash window](docs/img/dashboard.png)
 
-## The dash window (9 panes)
+It was built on one Mac with one SLURM cluster. Everything machine-specific lives in
+`~/.config/tmux-dashboard/config`.
 
-| Pane | Script | Shows |
-|---|---|---|
-| btop | `dash-btop` | system monitor (`update_ms = 4000` in `~/.config/btop/btop.conf`); watchdog restarts it if it freezes |
-| slurm | `slurm-panel` | HPC queue (`squeue` every 60 s, `sacct` 24 h every 5 min), shared cache so N dashboards = one poller; when ssh or one section fails it keeps the last good rows, shows the error and retries after 30 s; after a timeout it runs `ssh -O stop` so the next try opens a fresh connection (your open `ssh` shells stay up) |
-| local jobs | `local-jobs-panel` | jobs Claude sessions started on this Mac, plus finished ones (24 h); one `ps` scan every 10 s shared by all dashboards |
-| sessions | `claude-sessions-panel` | running Claude sessions: window (`w9`, or `1:w2` in another tmux session; a red `×2` = one conversation running in two windows), busy dot, title, context tokens, cost per step, then the minutes left while the cache is warm (bold cyan) or `↻$8.6`, what waking a cold one costs, then spent and last used. Busy first, then warm (least time left), then cold by wake cost; what does not fit ends in `… N more · K over 400K hidden`. **Nudge**: when an idle session past `CTX_WARN_K` has under `NUDGE_MIN` (10) minutes of warm cache left, a tmux message says so once (continue it or `/handoff`), even while the dash is hidden |
-| usage | `claude-usage-panel` | 5 h and 7 d rate limits (fed by `claude-statusline`); this month at API list prices, pace and last month, and with `MONTH_BUDGET_USD` its share (pace yellow from 80%, red from 100%; one tmux message each at 80% and 100% of month-to-date); today, last 7 days and today's costliest session; what the warm sessions cost per step right now; 7-day spend bars when the pane is tall. Spend: `claude_sessions.spend()`, incremental, index `~/.claude/dash/spend-index-v3.json` saved at most every 10 min (a day-old copy beside it, `.bak`); a transcript left unwritten for an hour is folded into token sums by day and model plus an 8-byte hash per response (to recognise copies), so a resumed session adds on top and a purged one keeps counting; it grows by ~16 bytes per response, not a whole record |
-| sensors | `sensors-panel` | macmon every 4 s + iSMC temperatures every 15 s; the power line is hidden while it reads all zero |
-| clock | `clock-panel` | big-digit clock, drawn once a minute (and at once on resize or a theme change) |
-| weather | `weather-panel` | Open-Meteo, keyless, 15 min cache |
-| spotify | `spotify-panel` | now playing; space/n/p/+/- when focused. Polled every 15 s while playing (sooner near the end of a track), 30 s when paused or closed, one poll shared by all dashboards; a key or `spotify-ctl` re-polls at once |
+- How it works inside: [docs/how-it-works.md](docs/how-it-works.md).
+- What changed: [NEWS.md](NEWS.md).
+- The screenshots come from a sandbox with made-up data: `demo/make-screenshots`.
 
-`tmux-dashboard` builds the window (`prefix+g` jumps to it; a `session-created` hook adds it to new
-sessions unless `TMUX_NO_AUTODASH=1`). `tmux-dash-layout` fits it to the screen, re-run by a `window-resized` hook
-(serialised by a lock, `~/.claude/dash/layout.lock`). It takes the first of these that fits, trying tall first on a
-portrait screen: **wide** (only when btop gets its 80 columns), **tall** (btop capped at 30 rows, the rest to the
-sessions pane), **compact** (from 96 columns: btop parked on one row, where it idles at 0% CPU) and **narrow** (one
-column); windows under 40x14 are left alone. The sessions pane gets at least 12 rows wherever the window has 23. Panes
-are found by the command they run (`ROLES` in that script; btop too, not by its index), then swapped into the order
-tmux fills a custom layout in; tmux ignores the ids inside a layout string. Window names are never parsed, so a name
-with spaces is fine.
+## Install
 
-**Nobody looking, no work.** Every panel and the session browser pause while no tmux client shows their window
-(`dashlib.visible()`: one `tmux list-windows` every 2 s, shared by all panels through `~/.claude/dash/shared/`), and
-catch up within ~4 s when you switch back; the web mirror counts as looking (it touches `~/.claude/dash/web-heartbeat`
-on every frame). They also skip redrawing unchanged frames, and an error draws one red line (traceback in
-`~/.claude/dash/panels.err`) instead of crash-looping through the respawn hook. Shared helpers: `bin/dashlib.py`.
+Requirements:
 
-Every pane ignores keystrokes (`select-pane -d`) so a stray key cannot quit btop, pause Spotify or change
-the local-jobs sort; `prefix+i` toggles input for the pane under the cursor. A dead widget is respawned by a
-`pane-died` hook.
-
-## Local jobs pane
-
-Ownership is found by walking the parent chain to a live session in `~/.claude/sessions/*.json`;
-for detached jobs (`nohup`, double fork) it falls back to `CLAUDE_PID` in the process environment,
-read via `sysctl KERN_PROCARGS2` (`ps e` shows nothing on this macOS), but only if it names a
-live session: the tmux server and apps launched from a session carry a stale value.
-
-Labels are the tool plus what it works on (script, sample, `src -> dst`), not shell plumbing (Claude's Bash wrapper,
-`… && pwd -P >| …`, is unwrapped). Columns: `win cpu mem age job` (mem is dropped below 34 columns; numbers are never
-cut); CPU turns yellow from 50% and red from 400%.
-Keys: `s` sort (age/cpu/mem/session), `f` filter (all/active/long/busy-sessions/done), `r` reset.
-Finished jobs are remembered for 24 h in `~/.claude/dash/localjobs-history.json`, recorded only
-while some dashboard is open. **The exit code is not observable from outside the process**, so a
-finished row says when it ended and how long it ran, not whether it worked.
-
-## Themes
-
-`dash-theme magi|eva01|eva02|default` flips tmux, btop, iTerm and VS Code together. For MAGI the
-dashboard is orange only: inactive pane borders `#a85a1c`, the selected pane `#ff4400` with a
-dark-orange background tint, default text in dash windows `#d9772b` (`DASH_TINT` in `dash-theme`;
-window-level options, so Claude's own windows are untouched). Needs the upstream MAGI-theme files
-(see `install.sh`).
-
-## Save / restore
-
-`tmux-claude-save` maps each pane to its Claude session id and writes `~/.tmux-claude-restore.sh`
-(dated copies in `~/.tmux-claude-saves/`), so each window comes back with `claude --resume <id>` in the right cwd.
-`tmux-claude-save NAME` writes a named snapshot instead (`~/.tmux-claude-saves/named/NAME.sh`, restored into a tmux
-session called NAME; saving the same name again moves the old file to `named/history/`), and `--list` shows every
-snapshot with its age and which of its sessions are gone. The restore script checks each session when it runs: a
-session whose transcript was deleted since (Claude Code purges inactive ones, `cleanupPeriodDays`) or one that is
-already running in another window is not resumed (this Mac keeps transcripts for a year: `"cleanupPeriodDays": 365`
-in `~/.claude/settings.json`; the default is 30 days) - the pane gets a one-line note with its stored title and the
-script lists them at the end. Saving is manual by choice. Never run a restore script blindly against live sessions
-older than this guard (snapshots saved before 2026-10-21 have no guard and would double-resume them).
-
-## Session browser (window 1), pinned tabs, window numbers
-
-| key | does |
-|---|---|
-| `prefix + g` | dashboard (window 0); recreated in its slot if you closed it |
-| `prefix + S` | session browser (window 1, `sessions`); recreated in its slot if you closed it |
-| `prefix + T` | pin / unpin the current tab |
-| `prefix + R` | close the gaps in the window numbers |
-
-**Session browser** - `claude-session-picker` lists every Claude session (title, folder, id, created, last used,
-size, running or not) from the transcripts in `~/.claude/projects`; `claude-session-index` prints the same table in
-a shell (`claude-session-index pcr --idle`, `--json`). The **context** column is what every step of a session (each prompt and
-each tool call) re-sends: `312K $.06 42m` = 312 thousand tokens re-read for 6 cents per step, the prompt cache warm for 42 more minutes
-(bold, in the theme's second colour); `312K $.06 ↻$2.5` = the cache went cold and the first step after resuming rewrites all
-of it for $2.50 (API list prices, by model; "exact" in the preview when the statusline reports the recache size). Money is
-always dollars, right-aligned (`$.06 $8.0 $25 $1.7k`).
-It turns yellow from `CTX_WARN_K=200` (/compact soon) and red from `CTX_CLEAR_K=400` thousand tokens (/clear or /compact now;
-for an idle session, a fresh one with a handoff note is cheaper than resuming), both settable in `~/.config/tmux-dashboard/config`. Sessions are grouped into **blocks** made automatically from the experiment code of their folder (`Exp011530` -> Exp,
-`Gen022830` -> Gen, `Cyt...`, `Seq...`, `TC...` and so on), or of a code named in the title ("exp011530 qPCR primers"); sessions
-started in the home folder go to `~`, the rest to Other. Gen, Cyt, Seq, Exp come first (`SESSION_BLOCK_ORDER=Gen,Cyt,Seq,Exp`
-in `~/.config/tmux-dashboard/config` changes that), other codes follow by recent use, then Other, then `~`; a block appears
-as soon as it has a session. Sessions started in `~` that name no experiment are split by topic (`~ Lab work`, `~ Lookups`, `~ Mac & tmux` ...) from
-keywords in the title, then the first prompt; the rules are `Name: keyword, keyword` lines, first match wins, and live in
-`~/.config/tmux-dashboard/topics` (start from `claude-session-index --print-topics`); a word shared by 4+ leftover titles
-becomes a topic by itself. **Auto** (always last, folded until you open it once) holds the sessions you did not start by hand: headless / SDK runs
-(`claude -p`, recorded as `entrypoint: sdk-*` in the transcript) and anything under `~/.claude/tests`, e.g. benchmark runs.
-Left / Right jump between blocks, Enter on a header folds it (remembered in
-`~/.claude/dash/picker.state`), Ctrl-G toggles a flat list, and `claude-session-index --block Exp` prints one block.
-Type to filter (a search opens every block and selects the first match); Enter resumes the highlighted session in a
-new window in its own folder, or jumps to its window if it is already running, so a conversation is never resumed
-twice. Tab cycles all / idle / running, Ctrl-Y copies the `claude --resume <id>` line, Ctrl-K ends a running
-session completely (asks first: `y`, or capital `Y` when it is busy; any other key or 8 s cancels; tmux sessions also
-lose their window, background ones go through `claude stop`; the transcript is never touched), Ctrl-O shows the stubs
-(sessions that were continued in another one, and empty ones), Esc / Ctrl-U clears the filter. It ignores the
-mouse and Ctrl-C/Z/D and has no quit key; the `pane-died` hook respawns it. "Last used" is the last user/assistant
-record, not the file mtime (Claude Code touches every open session's file). Shared code: `claude_sessions.py`.
-
-Filter words combine with tokens: `is:open is:warm is:cold is:running is:idle is:orphan`, `>400k` / `<100k` (context),
-`block:Exp` (prefix), `$>5` / `$<1` (spent); the search also reads the handoff note's title and `next:`. Ctrl-S cycles the
-sort within blocks (recent / spent / context / wake cost, remembered), Ctrl-V opens the row's note - or its digest - in a
-tmux popup, and `?` (with an empty filter), Ctrl-/ or F1 lists every key. The hint line shows what fits, most useful first;
-below 110 columns the id and date columns give way to the title (the rule line above the preview still names both).
-Colours: bold cyan (theme second) = cache warm, plain = cold, yellow / bright red = context past `CTX_WARN_K` /
-`CTX_CLEAR_K`, a bold white dot = busy right now, green = idle. Before acting, Enter / n / r re-check whether the session
-started running elsewhere or was already continued, so neither happens twice. `CLAUDE_PICKER_STATE` moves
-`picker.state` for tests.
-
-**Threads** - so a session can be closed without forgetting the task. `/handoff` (the skill in
-`claude/skills/handoff/SKILL.md`, linked into `~/.claude/skills/handoff/` by `install.sh`) writes
-`~/.claude/handoffs/<sessionId>.md`: front matter (`title`, `status: open|done`,
-`next:` the single next action, `continues:`) and Goal / Where it stands / Decisions / Dead ends / Next steps / Key
-files. While a note is open its session sits in the **Open** block at the top of the browser, whatever its folder, with
-the `next:` line in the preview and the note's age (`note 3d`, yellow after 7 days; the block lists the oldest note
-first); `/handoff done` or Ctrl-X in the browser closes it (Ctrl-X again reopens). An open note whose transcript is gone
-(Claude Code purges transcripts after `cleanupPeriodDays`) still gets a row, marked "transcript gone", where Enter offers
-only `n`. For a
-cold session not worth waking just to write a note, Ctrl-T **parks** it: the browser writes a stub note itself
-(`parked: yes`, `status: open`, `next:` = your last prompt there, plus a transcript digest), so it joins Open at once;
-then, in the background, `PARK_MODEL` (default `haiku`: `claude -p` with no tools, reading only the digest, ~15 s and
-under 1¢) rewrites the stub as a real note with a title and `next:` - `PARK_MODEL=off` keeps the stub, no AI call, and
-failures go to `~/.claude/dash/park.log`. Enter then `n` later hands the digest to a fresh session, which writes the
-full note. Ctrl-T never overwrites a note -
-on a done one it only reopens it. Enter on an
-idle session that has a note, or is past `CTX_WARN_K` and cold, asks first: `n` starts a new session in the same folder
-(`claude --session-id <new> --model <the old session's model> -n "<title> (cont.)" "<prompt>"`, so a Sonnet
-thread stays on Sonnet) that picks up from the note - or, with no note, from a
-digest the browser writes from the transcript with no API call (`~/.claude/handoffs/<id>.digest.md`: first prompt, every
-prompt you typed in the session, trimmed to ~8K characters, and the last ~25K characters of prompts and answers, tool
-traffic left out) and turns into a note; `r` resumes as is and
-shows what waking it costs. The old session is recorded in `~/.claude/dash/continued.json` and folds under the new one
-(Ctrl-O shows it); a note's `continues:` line links them too. `CLAUDE_HANDOFFS_DIR` / `CLAUDE_DASH_LINKS` move both
-files for tests.
-
-**Pinned tabs** - a window with the option `@pinned 1` is drawn on the left of the status bar, after the session
-badge, and left out of the scrolling window list, so it never scrolls away; clicking it works. `dash` and `sessions`
-are pinned by their launchers; `tmux-pin-tab [toggle|on|off|list|defaults]` does the rest (state `0` = explicitly
-unpinned). `dash-theme` writes the tab-strip formats into `~/.tmux/theme.conf` for every variant (`pin_block()`), so
-re-run `dash-theme <variant>` after changing them. `tmux-claude-save` records tabs you pinned.
-
-**Window numbers** - `tmux-claude-renumber` closes the gaps that build up in a session's window numbers and keeps
-`dash` at 0 and `sessions` at 1. Windows are only moved, never restarted, so every Claude session keeps running and
-the current window stays selected (the `~/.claude/sessions` registry stores `@window` ids, not indexes). `-n`
-previews, `-s NAME` picks a session, `--by title|path` also sorts. Reopening `dash` / `sessions` inserts it into its
-slot and shifts the windows behind it up by one. `claude --bg` sessions are not tmux windows, so they are not numbered.
-
-## Install on another Mac
-
-Requires macOS (Apple Silicon for `macmon`), Homebrew, Python >= 3.11 and tmux. Claude Code is needed for the
-sessions/usage panes; the SLURM pane needs an ssh alias that logs in without a password.
+- macOS on Apple Silicon (for `macmon`), Homebrew, Python 3.11+ and tmux.
+- Claude Code, for the Claude panes.
+- For the SLURM pane, an ssh alias that logs in without a password.
 
 ```
 git clone git@github.com:tiagobrc/tmux_dashboard_evangelion_theme.git ~/tmux-dashboard
 cd ~/tmux-dashboard
 ./install.sh --check                      # report what is missing, change nothing
-./install.sh --brew --theme magi          # install deps, link everything, fetch + apply the MAGI theme
-$EDITOR ~/.config/tmux-dashboard/config   # SLURM host/user, weather location
-tmux new -s main                          # the dash window is added automatically; prefix+g jumps to it
+./install.sh --brew --theme magi          # install deps, link everything, apply the MAGI theme
+$EDITOR ~/.config/tmux-dashboard/config   # SLURM host and user, weather location
+tmux new -s main                          # the dash window is added; prefix+g jumps to it
 ```
 
-`install.sh` is idempotent and never overwrites a regular file (it is moved to `<name>.bak-<date>`).
+`./install.sh` with no flags:
+
+- links `bin/*` into `~/.local/bin` (put it on your `PATH`) and `config/tmux.conf` to `~/.tmux.conf`;
+- links the `/handoff` skill into `~/.claude/skills/handoff/`;
+- creates `~/.config/tmux-dashboard/config`;
+- sets `statusLine` in `~/.claude/settings.json` if none is set, after backing the file up.
+
+It is safe to re-run. It never overwrites a regular file; an existing one is moved to `<name>.bak-<date>`.
 
 | Flag | Does |
 |---|---|
-| *(none)* | symlinks `bin/*` into `~/.local/bin`, `config/tmux.conf` into `~/.tmux.conf` and each file of `claude/skills/<name>/` into `~/.claude/skills/<name>/` (the `/handoff` command); creates `~/.config/tmux-dashboard/config`; sets `statusLine` in `~/.claude/settings.json` if unset (backed up first) |
-| `--brew` | `brew bundle` from `Brewfile` (tmux, btop, macmon, python) |
-| `--theme magi\|eva01\|eva02` | clones SinsuSquid/MAGI-theme into `~/.local/share/dash-theme/` and runs `dash-theme <variant>` (backs up your tmux/btop/iTerm/VS Code configs first; `dash-theme default` reverts) |
-| `--launchd` | installs and starts the lock-screen web mirror (`dash-web`, `http://127.0.0.1:8765/`, `DASH_WEB_PORT` to change; it follows the dash-theme palette and the dash window's text colour) |
+| `--brew` | installs tmux, btop, macmon and python from the `Brewfile` |
+| `--theme magi\|eva01\|eva02` | fetches the MAGI theme and applies it (see [Themes](#themes)) |
+| `--launchd` | installs and starts `dash-web`, the web mirror for the lock screen, at `http://127.0.0.1:8765/` |
 | `--check` | dry run |
 
-Make sure `~/.local/bin` is on your `PATH`.
-
-### Per-machine settings
-
-`~/.config/tmux-dashboard/config` (template: `config/dashboard.conf.example`), `KEY=VALUE` (quotes and ` # comments` are fine; a bad number falls back to the default with a warning),
-environment variables of the same name win:
-
-| Key | Meaning |
-|---|---|
-| `SLURM_HOST` / `SLURM_USER` | ssh alias of the cluster login node and your user there. Empty = the SLURM pane says it is not configured |
-| `WEATHER_LAT` / `WEATHER_LON` / `WEATHER_PLACE` / `WEATHER_TZ` | weather location; `WEATHER_TZ=auto` takes the zone from the coordinates |
-| `CTX_WARN_K` / `CTX_CLEAR_K` | context size (thousand tokens) that turns yellow (200) / red (400) in the browser and the sessions pane |
-| `NUDGE_MIN` | minutes of warm cache left at which an idle session past `CTX_WARN_K` gets a tmux nudge (10; 0 = off) |
-| `MONTH_BUDGET_USD` | monthly budget at API prices for the usage pane (empty = none) |
-| `PARK_MODEL` | model that writes a parked session's note from its digest (`haiku`; `off` = keep the stub) |
-| `WEEKLY_EXPORT_DIR` | where `claude-session-index --weekly` writes `Claude week <YYYY-Www>.md` (empty = print it) |
-| `SESSION_BLOCK_ORDER` | block order in the browser (`Gen,Cyt,Seq,Exp`) |
-
-### Optional pieces
-
-- **Temperatures** in the sensors pane: drop the [iSMC](https://github.com/dkorunic/iSMC) release binary at
-  `~/.local/bin/ismc`. Without it the pane shows macmon data only.
-- **Spotify** pane: needs the Spotify desktop app; otherwise it idles.
-- **Screensaver** (`saver/`): parked, not installed by `install.sh`.
-
-### Updating
-
-`git pull` is enough: scripts are symlinks. Re-run `./install.sh` after new scripts are added, then
+**Updating.** Run `git pull`; the scripts are symlinks. When new scripts arrive, re-run `./install.sh`, then
 `tmux source-file ~/.tmux.conf`.
+
+**Keep your transcripts.** By default Claude Code deletes transcripts after 30 days. A session without its transcript
+can no longer be resumed or restored; its spend still counts if the dashboard had read it before. Set
+`"cleanupPeriodDays": 365` in `~/.claude/settings.json` to keep a year. `install.sh` leaves this setting alone.
+
+## Keys
+
+| Key | Does |
+|---|---|
+| `prefix g` | the dashboard (window 0); recreated if you closed it |
+| `prefix S` | the session browser (window 1); recreated if you closed it |
+| `prefix T` | pin or unpin the current tab |
+| `prefix R` | close the gaps in the window numbers |
+| `prefix i` | let the pane under the cursor take keys, or stop it (dashboard panes ignore them) |
+
+## The dashboard
+
+| Pane | Shows |
+|---|---|
+| sessions | the running Claude sessions: context, cost per step, warm cache, spend |
+| usage | rate limits, spend at API prices, the size of the spend index |
+| slurm | your queue on the cluster and the last 24 h of jobs |
+| local jobs | jobs Claude sessions started on this Mac, and the ones that ended in the last 24 h |
+| btop | system monitor |
+| sensors | power and temperatures |
+| clock | the time |
+| weather | the forecast from Open-Meteo |
+| spotify | what is playing; space, `n`, `p`, `+` and `-` work when the pane is focused |
+
+- **Fits the window.** On every resize the dashboard picks a layout that fits: wide, tall, compact or narrow.
+- **Hidden means idle.** The panels and the session browser pause while no tmux client shows them, and catch up
+  within ~4 s when you look. The nudge and the budget message still come.
+- **Stray keys do nothing.** A key cannot quit btop or pause Spotify. Use `prefix i` to type into one pane.
+- **Errors stay contained.** A pane that dies is restarted. A panel error shows one red line; the traceback goes to
+  `~/.claude/dash/panels.err`.
+- Every new tmux session gets a dash window, unless `TMUX_NO_AUTODASH=1`.
+- Money is always in dollars, right-aligned: `$.06 $8.0 $25 $1.7k`.
+
+### Sessions pane
+
+| Column | Meaning |
+|---|---|
+| `w19` | the window; `0:w19` when it is in another tmux session. A red `×2` means one conversation runs in two windows |
+| `●` | bold white: busy; green: idle |
+| title | the session's title |
+| ctx | the context, in tokens, that every step (each prompt and each tool call) re-sends |
+| step | what one more step costs |
+| warm | minutes the cache stays warm (bold cyan), or `↻$14`: what the first step costs once it is cold |
+| spent | what the session has cost so far |
+| used | time since you last used it |
+
+- Busy sessions come first, then warm ones (least time left first), then cold ones (costliest to wake first).
+- When the list does not fit, it ends in `… N more · K over 400K hidden`.
+- **Nudge.** When an idle session past `CTX_WARN_K` has under `NUDGE_MIN` minutes of warm cache left, a tmux message
+  tells you once: continue it now, or `/handoff`. It comes even while the dashboard is hidden.
+
+### Usage pane
+
+- **Limits.** The 5-hour and 7-day rate limits, as `/usage` shows them. `claude-statusline` feeds them, so the status
+  line must be set up.
+- **Spend.** What the transcripts would cost at API list prices: this month, its pace, last month, today, the last 7
+  days and today's costliest session.
+- **Budget.** With `MONTH_BUDGET_USD` set, the month shows its share of the budget. The pace turns yellow at 80% of it
+  and red at 100%. A tmux message comes once when the month to date passes 80%, and once at 100%.
+- **Warm now.** How many sessions have a warm cache, what one more step of all of them costs, and when the next one
+  goes cold.
+- **Spend index.** The memory that counting spend takes in each process that shows spend (both panels and the browser,
+  per dashboard), and the size of its file.
+- A short pane keeps the most important lines. A tall one also gets the 7 days as bars.
+
+In a tall window the usage pane has room for every line:
+
+<img src="docs/img/dashboard-narrow.png" alt="The dash window in a tall layout" width="560">
+
+### Local jobs pane
+
+- Columns: `win cpu mem age job`. CPU turns yellow from 50% and red from 400%.
+- Keys, after `prefix i`: `s` sorts by age, cpu, mem or session; `f` filters (all, active, long, busy sessions, done);
+  `r` resets.
+- Finished jobs stay for 24 h. They show when they ended and how long they ran, **but not whether they worked**: a
+  job's exit code cannot be seen from outside it.
+
+### SLURM pane
+
+- `squeue` runs every 60 s and `sacct` (the last 24 h) every 5 min, once for all dashboards.
+- When ssh or one of the two fails, the pane keeps its last good rows, shows the error, and retries that one after
+  30 s.
+
+## Session browser (window 1)
+
+![The session browser](docs/img/session-browser.png)
+
+Every Claude session on this Mac, grouped into blocks, with what it would cost to resume. Each row shows the window
+and busy dot, when it was last used and created, its id, context, cost per step, warm minutes or wake cost, spend,
+title, note age and folder.
+
+| Key | Does |
+|---|---|
+| type | filter; a search opens every block |
+| Enter | resume the session in a new window in its folder, or jump to it if it is running |
+| Tab | show all, idle or running sessions |
+| Left / Right | previous / next block |
+| Enter on a header | fold or unfold the block |
+| Ctrl-G | a flat list, without blocks |
+| Ctrl-S | sort within blocks: recent, spent, context, wake cost |
+| Ctrl-V | view the row's note or digest |
+| Ctrl-T | park the thread (see [Threads](#threads)) |
+| Ctrl-X | mark the thread done, or reopen it |
+| Ctrl-K | end a running session; it asks first |
+| Ctrl-Y | copy `claude --resume <id>` |
+| Ctrl-O | show stubs: continued and empty sessions |
+| Esc / Ctrl-U | clear the filter |
+| `?` (filter empty), Ctrl-/, F1 | list every key |
+
+- Ctrl-K ends the session only on `y`, or `Y` if it is busy. Any other key, or 8 s, cancels. The transcript is kept.
+- The browser has no quit key, and ignores the mouse and Ctrl-C/Z/D. If it dies, the `pane-died` hook restarts it.
+
+**The context column.**
+
+- `312K $.06 42m`: each step re-sends 312K tokens for 6¢, and the cache stays warm for 42 more minutes.
+- `312K $.06 ↻$2.5`: the cache is cold, so the first step after resuming costs $2.50.
+
+| Colour | Means |
+|---|---|
+| bold cyan | cache warm |
+| plain | cache cold |
+| yellow | past `CTX_WARN_K` (200K): /compact soon |
+| bright red | past `CTX_CLEAR_K` (400K): /clear or /compact now; for an idle session, a fresh one from a note is cheaper |
+| dot: bold white / green | busy / idle |
+
+**Filters.** Words combine with these tokens. The search also reads a note's title and its `next:` line.
+
+| Token | Keeps |
+|---|---|
+| `is:open` `is:warm` `is:cold` `is:running` `is:idle` `is:orphan` | sessions in that state |
+| `>400k` `<100k` | context above or below |
+| `$>5` `$<1` | spend above or below |
+| `block:Exp` | blocks whose name starts with it |
+
+**Blocks.**
+
+- A session's block comes from the experiment code in its folder or title: `Exp011530` goes to Exp, `Gen022830` to
+  Gen, and likewise `Cyt…`, `Seq…`, `TC…`.
+- The order is Open, then Gen, Cyt, Seq and Exp (`SESSION_BLOCK_ORDER`), other codes by recent use, Other, `~`, and
+  Auto last.
+- Sessions started in `~` without an experiment code are split by topic, such as `~ Lab work`. The rules live in
+  `~/.config/tmux-dashboard/topics`; `claude-session-index --print-topics` gives a starting file.
+- **Auto** holds the sessions you did not start by hand: `claude -p` and SDK runs, and anything under
+  `~/.claude/tests`.
+
+**In a shell.** `claude-session-index` prints the same table, filtered by any words you give it:
+`claude-session-index pcr --idle`. Other options include `--json`, `--block Exp` and `--weekly`.
+
+## Threads
+
+Close a session without losing its task.
+
+1. **`/handoff`** in a session writes a note to `~/.claude/handoffs/<session>.md`. The note has a title, a `next:` line
+   (the single next action), and the goal, state, decisions, dead ends, next steps and files.
+2. While the note is open, its session sits in the browser's **Open** block at the top, whatever its folder. The
+   preview shows the `next:` line. The row shows the note's age (`note 3d`), yellow after 7 days; the oldest note
+   comes first.
+3. **Enter** on an idle session that has a note, or on a cold one past `CTX_WARN_K`, asks how to continue:
+   - `n` starts a fresh session in the same folder, on the same model, from the note. With no note, it starts from a
+     digest of the transcript;
+   - `r` resumes the session as it is, and shows what waking it costs.
+4. **Ctrl-T parks** a cold session without waking it. A stub note appears at once, then `PARK_MODEL` (haiku: ~15 s,
+   under 1¢) rewrites it from a digest.
+5. **`/handoff done`** or **Ctrl-X** closes the thread. Ctrl-X again reopens it.
+
+- The old session folds under the new one; Ctrl-O shows it.
+- When Claude Code purges a transcript, its open note stays, marked "transcript gone"; there Enter offers only `n`.
+
+## Save and restore
+
+- `tmux-claude-save` writes `~/.tmux-claude-restore.sh`, which reopens each window with `claude --resume <id>` in its
+  folder. Dated copies go to `~/.tmux-claude-saves/`.
+- `tmux-claude-save NAME` saves a named snapshot that restores into a tmux session called NAME. `--list` shows every
+  snapshot, its age, and which of its sessions are gone.
+- The restore script skips any session that is already running elsewhere or whose transcript is gone, and lists them
+  at the end.
+- Saving is manual, on purpose. **Do not run a snapshot saved before 2026-10-21 against live sessions:** it lacks this
+  check and would resume them twice.
+
+## Tabs and window numbers
+
+- **Pinned tabs** stay at the left of the status bar and never scroll away. `dash` and `sessions` are pinned by their
+  launchers; `tmux-pin-tab toggle|on|off|list|defaults` handles the rest.
+- **`tmux-claude-renumber`** (`prefix R`) closes the gaps in the window numbers. It keeps `dash` at 0 and `sessions` at 1,
+  and moves windows without restarting them. `-n` previews.
+
+## Themes
+
+- `dash-theme magi|eva01|eva02|default` switches tmux, btop, iTerm and VS Code together.
+- MAGI turns the dashboard orange; Claude's own windows keep their colours.
+- The themes need the MAGI-theme files, which `install.sh --theme` fetches.
+
+## Settings
+
+Settings go in `~/.config/tmux-dashboard/config` as `KEY=VALUE` lines. The template is
+`config/dashboard.conf.example`. An environment variable of the same name wins.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `SLURM_HOST`, `SLURM_USER` | empty | ssh alias of the cluster's login node, and your user there; when empty, the pane says it is not configured |
+| `WEATHER_LAT`, `WEATHER_LON`, `WEATHER_PLACE`, `WEATHER_TZ` | NYC, `auto` | where the weather is for; `WEATHER_TZ=auto` takes the time zone from the coordinates |
+| `CTX_WARN_K`, `CTX_CLEAR_K` | 200, 400 | context, in thousands of tokens, that turns yellow or red |
+| `NUDGE_MIN` | 10 | warm minutes left that trigger the nudge; 0 turns it off |
+| `MONTH_BUDGET_USD` | empty | monthly budget at API prices |
+| `PARK_MODEL` | haiku | the model that writes a parked thread's note; `off` keeps the stub |
+| `WEEKLY_EXPORT_DIR` | empty | where `claude-session-index --weekly` writes `Claude week <YYYY-Www>.md`; empty prints it |
+| `SESSION_BLOCK_ORDER` | Gen,Cyt,Seq,Exp | the browser's block order |
+
+## Optional pieces
+
+- **Temperatures.** Put the [iSMC](https://github.com/dkorunic/iSMC) release binary at `~/.local/bin/ismc`. Without it
+  the sensors pane shows `macmon` data only.
+- **Spotify.** The pane needs the Spotify desktop app; without it, the pane stays idle.
+- **Screensaver** (`saver/`): on hold, and not installed (see below).
 
 ## Known issues
 
-- Screensaver (`saver/`): shows the dashboard for a few seconds, then goes black. Leading
-  hypothesis: it blanks on the global `com.apple.screensaver.willstop` notification and never
-  reloads. Parked.
-- `tmux-dashboard <session> [index] [-d]`: `-d` is the third argument; in the index slot it is read
-  as a window offset.
+- **The screensaver goes black** after showing the dashboard for a few seconds. It is on hold; the leading guess is in
+  [docs/how-it-works.md](docs/how-it-works.md#screensaver).
+- **`tmux-dashboard <session> [index] [-d]`**: `-d` must be the third argument. Put in the index slot, it is read as a
+  window offset.
+
+## Repository
+
+| Folder | Holds |
+|---|---|
+| `bin/` | the scripts, linked into `~/.local/bin` |
+| `config/` | `tmux.conf` and the settings template |
+| `claude/skills/` | the `/handoff` skill |
+| `launchd/` | `dash-web.plist.in`, the web mirror's launch agent; `install.sh` fills in the paths |
+| `demo/` | the sandbox that makes the screenshots |
+| `docs/` | how it works, and the screenshots |
+| `saver/` | the "Tmux Dashboard" screensaver, a WKWebView of `dash-web` (on hold) |
