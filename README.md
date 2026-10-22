@@ -116,7 +116,8 @@ call (`parked: yes`, `status: open`, `next:` = your last prompt there, plus a tr
 Enter then `n` later hands the digest to a fresh session, which writes the real note. Ctrl-T never overwrites a note -
 on a done one it only reopens it. Enter on an
 idle session that has a note, or is past `CTX_WARN_K` and cold, asks first: `n` starts a new session in the same folder
-(`claude --session-id <new> -n "<title> (cont.)" "<prompt>"`) that picks up from the note - or, with no note, from a
+(`claude --session-id <new> --model <the old session's model> -n "<title> (cont.)" "<prompt>"`, so a Sonnet
+thread stays on Sonnet) that picks up from the note - or, with no note, from a
 digest the browser writes from the transcript with no API call (`~/.claude/handoffs/<id>.digest.md`: first prompt and
 the last ~25K characters of prompts and answers, tool traffic left out) and turns into a note; `r` resumes as is and
 shows what waking it costs. The old session is recorded in `~/.claude/dash/continued.json` and folds under the new one

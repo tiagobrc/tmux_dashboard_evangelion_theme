@@ -21,7 +21,7 @@ Threads: /handoff (~/.claude/skills/handoff) writes ~/.claude/handoffs/<sessionI
 session sits in the Open block at the top, whatever its folder. Enter on an idle session that has a note, or is big
 (CTX_WARN_K) and cold, asks first: n = a new session in the same folder that starts from the note - or, without one,
 from a digest of the transcript made here for free (no API call) - started with --session-id so the old one folds under
-it; r = resume as is.
+it, and with --model set to the old session's model; r = resume as is.
   Left Right  jump to the previous / next block   Enter on a header  fold / unfold it   Ctrl-G  by block / flat list
 Blocks are made automatically from the experiment code of the session's folder (Exp011530 -> Exp, Gen022830 -> Gen,
 Cyt..., Seq...), or of a code named in its title; sessions started in the home folder go to ~, the rest to Other.
@@ -105,7 +105,9 @@ def continue_cmd(r, new):
         prompt = (f"{cs.write_digest(r)} is a digest of an earlier session in this folder{parked}, made from its transcript "
                   f"without waking it. Read it, write this thread's handoff note with the handoff skill so the session "
                   f"browser tracks it, then tell me in 3 lines where we left off and what is next.")
-    return f"{CLAUDE_BIN} --session-id {new} -n {shlex.quote(fit(r['title'], 48) + ' (cont.)')} {shlex.quote(prompt)}"
+    model = (r["ctx"] or {}).get("model")          # the old session's model, so a Sonnet thread does not move to the default
+    flag = f"--model {shlex.quote(model)} " if model else ""
+    return f"{CLAUDE_BIN} --session-id {new} {flag}-n {shlex.quote(fit(r['title'], 48) + ' (cont.)')} {shlex.quote(prompt)}"
 
 
 def continue_row(r, sess):
@@ -414,9 +416,10 @@ class Picker:
         c = r["ctx"]
         wake = f" ({cs.money(c['wake'])} on the first prompt)" if c and not c["warm"] else ""
         src = "its handoff note" if r["handoff"] else "a digest of it (made here, free)"
+        on = f" on {c['model'].removeprefix('claude-')}" if c and c.get("model") else ""
         self.confirm = {"keys": {"n": lambda: self.run(lambda: continue_row(r, self.sess)),
                                  "r": lambda: self.run(lambda: open_row(r, self.sess))},
-                        "prompt": f"n = new session from {src}  ·  r = resume as is{wake}  ·  any other key cancels",
+                        "prompt": f"n = new session{on} from {src}  ·  r = resume as is{wake}  ·  any other key cancels",
                         "until": time.time() + 20}
 
     def run(self, action):
