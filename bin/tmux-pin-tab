@@ -1,0 +1,38 @@
+#!/bin/bash
+# Pin or unpin a tab. Pinned tabs sit on the left of the status bar, right after the session badge, and never scroll
+# out of the window list; the `dash` and `sessions` windows are pinned by default. (prefix + T toggles the current tab.)
+#   tmux-pin-tab [toggle] [window]   pin / unpin a window (default: the current one)
+#   tmux-pin-tab on|off [window]
+#   tmux-pin-tab list                pinned tabs, per session
+#   tmux-pin-tab defaults            pin dash + sessions windows that have no setting yet (config load runs this)
+# The state is the window option @pinned (1 = pinned, 0 = explicitly unpinned); the tab strip itself is drawn by the
+# formats dash-theme writes into ~/.tmux/theme.conf.
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+cmd="${1:-toggle}"
+win="${2:-}"
+[ -n "$win" ] || win=$(tmux display-message -p '#{window_id}')
+
+if [ "$cmd" = toggle ]; then      # (macOS ships bash 3.2: no ;;& fall-through)
+    if [ "$(tmux display-message -p -t "$win" '#{@pinned}')" = 1 ]; then cmd=off; else cmd=on; fi
+fi
+
+case "$cmd" in
+    on|off)
+        [ "$cmd" = on ] && v=1 || v=0
+        tmux set-option -w -t "$win" @pinned "$v"
+        tmux refresh-client -S 2>/dev/null
+        name=$(tmux display-message -p -t "$win" '#I #W')
+        tmux display-message -d 1500 "tab ${name}: $([ $v = 1 ] && echo pinned || echo unpinned)"
+        ;;
+    list)
+        tmux list-windows -a -F '#{@pinned} #{session_name}:#{window_index} #{window_name}' | awk '$1==1{print $2, $3}'
+        ;;
+    defaults)
+        tmux list-windows -a -F '#{window_id} #{window_name} #{@pinned}' | while read -r id name pinned; do
+            case "$name" in dash|sessions) [ -z "$pinned" ] && tmux set-option -w -t "$id" @pinned 1 ;; esac
+        done
+        tmux refresh-client -S 2>/dev/null
+        ;;
+    *) echo "usage: tmux-pin-tab [toggle|on|off|list|defaults] [window]" >&2; exit 2 ;;
+esac
+exit 0

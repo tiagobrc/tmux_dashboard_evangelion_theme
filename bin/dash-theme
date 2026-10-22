@@ -19,6 +19,7 @@ import json, os, plistlib, re, shutil, subprocess, sys, time, tomllib
 from pathlib import Path
 
 HOME = Path.home()
+PL = "\ue0b0"   # powerline arrow drawn after the badge and the current tab
 BASE = HOME / ".local" / "share" / "dash-theme"
 REPO = BASE / "MAGI-theme"
 STATE = BASE / "active"
@@ -36,7 +37,8 @@ SLOGAN = "#{?#{==:#{pane_title},#{host}},#W,#{pane_title}}"
 # text = default text colour inside dash windows, tint = background of the selected dash pane.
 DASH_TINT = {"magi": {"border": "#a85a1c", "active": "#ff4400", "text": "#d9772b", "tint": "#1f0a00"}}
 THEMED_TMUX_OPTIONS = ["status-style", "message-style", "mode-style", "pane-border-style", "pane-active-border-style",
-                       "status-left", "status-left-length", "window-status-format", "window-status-current-format"]
+                       "status-left", "status-left-length", "window-status-format", "window-status-current-format",
+                       "window-status-separator"]
 
 
 def palette(variant):
@@ -62,25 +64,43 @@ def tmux(*args):
     return subprocess.run(["tmux", *args], capture_output=True, text=True)
 
 
+def pin_block(tab, tab_cur, left):
+    """Tab strip with pinned tabs. A window whose `@pinned` option is 1 (tmux-pin-tab; dash and sessions by default)
+    is drawn in status-left, right after `left`, and left out of the scrolling window list - so it never scrolls
+    away and stays clickable (range=window). tab / tab_cur are the variant's own window-status formats."""
+    # commas inside #[fg=..,bg=..] would split the surrounding #{?..} / #{W:..}, so they are escaped as #,
+    esc = lambda f: re.sub(r"#\[[^\]]*\]", lambda m: m.group(0).replace(",", "#,"), f)
+    t, c = esc(tab), esc(tab_cur)
+    pin = lambda body: "#{?#{@pinned},%s,}" % body
+    strip = "#{W:%s,%s}" % (pin("#[range=window|#{window_index}]" + t + " #[norange]"),
+                            pin("#[range=window|#{window_index}]" + c + " #[norange]"))
+    return f"""set -g window-status-separator ""
+set -g window-status-format "#{{?#{{@pinned}},,{t} }}"
+set -g window-status-current-format "#{{?#{{@pinned}},,{c} }}"
+set -g status-left-length 140
+set -g status-left "{left}{strip}"
+"""
+
+
 def apply_tmux(variant):
     TMUX_THEME.parent.mkdir(exist_ok=True)
     if variant == "default":
-        TMUX_THEME.write_text("# dash-theme: default look (no overrides)\n")
+        TMUX_THEME.write_text("# dash-theme: default look (no other overrides)\n"
+                              + pin_block("#I:#W#{window_flags}", "#I:#W#{window_flags}", "[#{session_name}] "))
     else:
         p, badge = palette(variant), VARIANTS[variant][0]
         t = DASH_TINT.get(variant, {})
         p = dict(p, grey_border=t.get("border", p["grey"]), active_border=t.get("active", p["accent"]))
+        tab = f"#[fg={p['muted']},bg={p['bg']}] #I #{{=/18/…:{SLOGAN}}} "
+        tab_cur = f"#[fg={p['bg']},bg={p['accent']},bold] #I {SLOGAN} #[fg={p['accent']},bg={p['bg']},nobold]{PL}"
+        left = f"#[fg={p['accent']},bg={p['grey']},bold] {badge} #[fg={p['fg']},bg={p['grey']},nobold]#S #[fg={p['grey']},bg={p['bg']}]{PL} "
         TMUX_THEME.write_text(f"""# dash-theme: {variant} - generated, edit ~/.local/bin/dash-theme instead
 set -g status-style "bg={p['bg']},fg={p['accent']}"
 set -g message-style "fg={p['bg']},bg={p['accent']},bold"
 set -g mode-style "fg={p['bg']},bg={p['second']}"
 set -g pane-border-style "fg={p['grey_border']}"
 set -g pane-active-border-style "fg={p['active_border']},bold"
-set -g status-left-length 30
-set -g status-left "#[fg={p['accent']},bg={p['grey']},bold] {badge} #[fg={p['fg']},bg={p['grey']},nobold]#S #[fg={p['grey']},bg={p['bg']}] "
-set -g window-status-format "#[fg={p['muted']},bg={p['bg']}] #I #{{=/18/…:{SLOGAN}}} "
-set -g window-status-current-format "#[fg={p['bg']},bg={p['accent']},bold] #I {SLOGAN} #[fg={p['accent']},bg={p['bg']},nobold]"
-""")
+{pin_block(tab, tab_cur, left)}""")
     hook = "source-file -q ~/.tmux/theme.conf"
     if TMUX_CONF.exists() and hook not in TMUX_CONF.read_text():
         with open(TMUX_CONF, "a") as fh:
@@ -96,14 +116,14 @@ set -g window-status-current-format "#[fg={p['bg']},bg={p['accent']},bold] #I {S
 
 
 def style_dash_windows(variant=None):
-    """Window-level colours for every `dash` window: default text orange, selected pane tinted. Window options,
+    """Window-level colours for every `dash` (and `sessions`) window: default text orange, selected pane tinted. Window options,
     so Claude's own windows are untouched; `-u` removes them again for variants without a tint."""
     if variant is None:
         variant = STATE.read_text().strip() if STATE.exists() else "default"
     t = DASH_TINT.get(variant)
     for line in tmux("list-windows", "-a", "-F", "#{window_id} #{window_name}").stdout.splitlines():
         wid, _, name = line.partition(" ")
-        if name != "dash":
+        if name not in ("dash", "sessions"):   # sessions = the Claude session browser (claude-session-picker)
             continue
         if t:
             tmux("set", "-w", "-t", wid, "window-style", f"fg={t['text']}")

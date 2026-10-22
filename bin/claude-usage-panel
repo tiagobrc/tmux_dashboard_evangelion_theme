@@ -6,10 +6,19 @@ Reads the JSON that ~/.local/bin/claude-statusline saves for every session
 Idle sessions keep reporting the limits they last saw, so for each window we
 trust the newest reset time and, within it, the highest percentage (usage only
 grows inside a window).
+
+The month line is what this month would have cost at API list prices (what an
+Enterprise or API account is billed), from claude_sessions.spend(): every
+transcript, subagents included, counted in a background thread once a minute.
 """
-import json, os, re, shutil, subprocess, sys, time
+import calendar, json, os, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import claude_sessions as cs
+
+SPEND_EVERY = 60                                              # seconds between month-to-date recounts
+_spend = {"by": None}
 STATUS = Path.home() / ".claude" / "dash" / "status"
 REGISTRY = Path.home() / ".claude" / "sessions"
 DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
@@ -72,6 +81,32 @@ def limit(status, key, now):
     return best
 
 
+def count_spend():
+    while True:
+        try:
+            _spend["by"] = cs.spend()
+        except Exception:
+            pass                                              # keep the last count; the panel must never die on this
+        time.sleep(SPEND_EVERY)
+
+
+def month_line(now, cols):
+    """' Oct at API prices $1,210 · pace $1,900 · Sep $1,750' - pace = so far / share of the month gone."""
+    by = _spend["by"]
+    if by is None:
+        return f"{DIM} month to date: counting the transcripts…{OFF}"
+    lt = time.localtime(now)
+    start = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+    prev = time.localtime(start - 86400)
+    mtd = by.get(time.strftime("%Y-%m", lt), 0)
+    pace = mtd / max((now - start) / 86400, 0.5) * calendar.monthrange(lt.tm_year, lt.tm_mon)[1]
+    last = by.get(time.strftime("%Y-%m", prev))
+    text = f" {time.strftime('%b', lt)} at API prices {BOLD}${mtd:,.0f}{OFF}{DIM} · pace ${pace:,.0f}"
+    plain = len(f" {time.strftime('%b', lt)} at API prices ${mtd:,.0f} · pace ${pace:,.0f}")
+    extra = f" · {time.strftime('%b', prev)} ${last:,.0f}" if last else ""
+    return text + (extra if plain + len(extra) <= cols - 1 else "") + OFF
+
+
 def render():
     cols, rows = shutil.get_terminal_size()
     now, status, live = time.time(), load(), live_windows()
@@ -85,6 +120,7 @@ def render():
         resets, used = got
         when = time.strftime("%H:%M" if resets - now < 86400 else "%a %H:%M", time.localtime(resets))
         out.append(f" {label} {bar(used, bw)} {level(used)}{used:3.0f}%{OFF} {DIM}resets {when} ({span(resets - now)}){OFF}")
+    out.append(month_line(now, cols))
 
     sessions = sorted(((live[s.get("session_id")][0], s) for s in status if s.get("session_id") in live),
                       key=lambda t: -live[t[1]["session_id"]][1])   # most recently used first, like the sessions panel
@@ -99,8 +135,10 @@ def render():
             model = re.sub(r"^Claude ", "", (s.get("model") or {}).get("display_name") or "?")[:9]
             pc = s.get("prompt_cache") or {}
             left = (pc.get("expires_at") or 0) - now
-            cache = f"warm {span(left)}" if pc.get("warm") and left > 0 else "cold" if pc else ""
-            out.append(f" {win:>2} {bar(p, cw_bar)} {level(p)}{p:3.0f}%{OFF} {model:<9} {DIM}{cache}{OFF}")
+            warm = pc.get("warm") and left > 0
+            cache = f"warm {span(left)}" if warm else "cold" if pc else ""
+            tint = "\033[38;5;208m" if warm else "\033[38;5;75m"          # orange warm, sky blue cold, as in the sessions panel
+            out.append(f" {win:>2} {bar(p, cw_bar)} {level(p)}{p:3.0f}%{OFF} {model:<9} {tint}{cache}{OFF}")
         cost = sum((s.get("cost") or {}).get("total_cost_usd") or 0 for _, s in sessions)
         out.append(f"{DIM} live sessions ≈ ${cost:,.0f} at API prices (covered by the plan){OFF}")
     out = out[:max(rows, 1)]
@@ -108,8 +146,10 @@ def render():
 
 
 if "--once" in sys.argv:
+    _spend["by"] = cs.spend()
     print(render())
     sys.exit(0)
+threading.Thread(target=count_spend, daemon=True).start()
 sys.stdout.write("\033[?25l\033[2J")
 try:
     while True:

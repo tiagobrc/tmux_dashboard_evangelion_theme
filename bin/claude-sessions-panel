@@ -2,16 +2,48 @@
 """Live panel of running Claude Code sessions, for the tmux dashboard window.
 
 Joins ~/.claude/sessions/<pid>.json (status, session id) with tmux panes
-(window number, pane title = Claude's own topic summary).
+(window number, pane title = Claude's own topic summary), and each session's context from
+claude_sessions (same column as the session browser): '231K 5¢ 42m' = 231 thousand tokens, 5 cents
+per step, warm for 42 more minutes; '859K ↻$8.6' = cold, the next step rewrites it all for $8.60.
 """
 import json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import claude_sessions as cs
 
 REGISTRY = Path.home() / ".claude" / "sessions"
 SNAPSHOT = Path.home() / ".tmux-claude-restore.sh"
 SEP = "\x1f"
 DOT = {"busy": "\033[33m●\033[0m", "idle": "\033[32m●\033[0m", "shell": "\033[36m●\033[0m"}
 DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
+LEVEL = {1: "\033[1;33m", 2: "\033[1;31m"}                  # context past CTX_WARN_K yellow, past CTX_CLEAR_K red
+WARM, COLD = "\033[38;5;208m", "\033[38;5;75m"               # prompt cache: orange while warm, sky blue once cold
+CTX_EVERY = 10                                                # seconds between context refreshes (transcripts are cached)
+_ctx = {"at": 0, "by_id": {}}
+
+
+def contexts():
+    """sessionId -> its claude_sessions row (context, total spent), refreshed every CTX_EVERY seconds."""
+    if time.time() - _ctx["at"] > CTX_EVERY:
+        try:
+            _ctx["by_id"] = {r["id"]: r for r in cs.build()}
+        except Exception:
+            pass                                              # keep the last good map; the panel must never die on this
+        _ctx["at"] = time.time()
+    return _ctx["by_id"]
+
+
+def ctx_cell(r, status):
+    """Coloured context columns, 22 cells: size, price, warm minutes left, total so far. The size is yellow / red past
+    the thresholds, the price orange while warm and blue once cold, the minutes yellow under 10 for an idle session."""
+    if not r:
+        return " " * 22
+    size, cost, left, spent = cs.ctx_cells(r)
+    c = r["ctx"] or {}
+    hurry = c.get("warm") and status != "busy" and c.get("left", 1e9) < 600
+    return (f"{LEVEL.get(c.get('level'), '')}{size:>5}{OFF} {WARM if c.get('warm') else COLD}{cost:<5}{OFF} "
+            f"{chr(27) + '[33m' if hurry else DIM}{left:>4}{OFF} {spent:>5}")
 
 
 def ago(seconds):
@@ -56,25 +88,30 @@ def rows():
         status = s.get("status", "?")
         last = max(s.get("statusUpdatedAt", 0), s.get("updatedAt", 0), s.get("startedAt", 0)) / 1000
         idle_for = now - (last or now)
-        yield (-last,), where, status, title or Path(s.get("cwd", "")).name, ago(idle_for)   # most recently used first
+        yield (-last,), where, status, title or Path(s.get("cwd", "")).name, ago(idle_for), s.get("sessionId")   # most recently used first
 
 
 def render():
     cols, height = shutil.get_terminal_size()
     data = sorted(rows())
+    ctx = contexts()
     busy = sum(1 for r in data if r[2] == "busy")
-    out = [f"{BOLD} Claude sessions{OFF}  {len(data)} running, {busy} busy", ""]
-    room = max(min(cols - 12, 72), 8)  # keep the age column near the title on very wide panes
-    for _, where, status, title, age in data:
+    big = sum(1 for r in data if ((ctx.get(r[5]) or {}).get("ctx") or {}).get("level") == 2)
+    room = max(min(cols - 35, 60), 8)  # keep the context and age columns near the title on very wide panes
+    out = [f"{BOLD} Claude sessions{OFF}  {len(data)} running, {busy} busy"
+           + (f"  {LEVEL[2]}{big} over {cs.CTX_CLEAR // 1000}K{OFF}" if big else ""),
+           f"{DIM}      {'':<{room}} {'ctx':>5} {'step':<5} {'warm':>4} {'spent':>5} {'used':>4}{OFF}"]
+    for _, where, status, title, age, sid in data:
         if len(title) > room:
             title = title[:room - 1] + "…"
-        out.append(f" {where} {DOT.get(status, '○')} {title:<{room}} {DIM}{age:>4}{OFF}")
+        out.append(f" {where} {DOT.get(status, '○')} {title:<{room}} {ctx_cell(ctx.get(sid), status)} {DIM}{age:>4}{OFF}")
     out.append("")
     if SNAPSHOT.exists():
         n = SNAPSHOT.read_text().count("claude --resume")
         out.append(f"{DIM} snapshot: {n} sessions, {ago(time.time() - SNAPSHOT.stat().st_mtime)}{'' if time.time() - SNAPSHOT.stat().st_mtime < 60 else ' ago'}"
                    f" (tmux-claude-save){OFF}")
     out.append(f"{DIM} {DOT['busy']}{DIM} busy  {DOT['idle']}{DIM} idle  {DOT['shell']}{DIM} idle, background shell open{OFF}")
+    out.append(f"{DIM} ctx: {OFF}{WARM}5¢{OFF}{DIM}/step · warm 42m more · {OFF}{COLD}↻${OFF}{DIM} = cold, cost to wake{OFF}")
     out = out[:max(height - 1, 1)]  # never scroll the pane: clip to its height
     return "\033[H" + "".join(l + "\033[K\n" for l in out) + "\033[J"
 

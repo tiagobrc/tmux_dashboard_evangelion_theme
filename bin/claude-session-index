@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""List Claude Code sessions: when, where, what, and the id to resume.
+
+    claude-session-index                 table, newest use first (stubs continued elsewhere and empty sessions hidden)
+    claude-session-index pcr exp0115     only rows containing every word (title, folder, id, prompts)
+    claude-session-index --idle          only sessions that are not running now
+    claude-session-index --live          only running ones
+    claude-session-index --block Exp     only that block (Gen, Cyt, Seq, Exp ... ~ = started in the home folder)
+    claude-session-index --all           also the stubs
+    claude-session-index -n 20           first 20 rows
+    claude-session-index --json          machine-readable rows
+"""
+import argparse, json, os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import claude_sessions as cs
+
+
+def main():
+    ap = argparse.ArgumentParser(description="List Claude Code sessions.")
+    ap.add_argument("words", nargs="*", help="filter: rows must contain every word")
+    ap.add_argument("--idle", action="store_true"), ap.add_argument("--live", action="store_true")
+    ap.add_argument("--all", action="store_true", help="include stubs continued in another session and empty sessions")
+    ap.add_argument("-n", type=int, default=0, help="limit rows")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--block", help="only this block (experiment code, Other, ~, or a topic such as '~ Lookups')")
+    ap.add_argument("--print-topics", action="store_true", help="print the topic rules in use (save as ~/.config/tmux-dashboard/topics to edit)")
+    a = ap.parse_args()
+
+    if a.print_topics:
+        print(cs.TOPICS_FILE.read_text() if cs.TOPICS_FILE.exists() else cs.DEFAULT_TOPICS, end="")
+        return
+    rows = cs.build()
+    if not a.all:
+        rows = [r for r in rows if not (r["folded"] or r["empty"])]
+    if a.idle:
+        rows = [r for r in rows if not r["live"]]
+    if a.live:
+        rows = [r for r in rows if r["live"]]
+    if a.block:
+        rows = [r for r in rows if r["block"].lower() == a.block.lower()]
+    words = [w.lower() for w in a.words]
+    rows = [r for r in rows if cs.matches(r, words)]
+    if a.n:
+        rows = rows[:a.n]
+    if a.json:
+        json.dump(rows, sys.stdout, indent=1)
+        return
+    now = time.time()
+    bw = max([5] + [len(r["block"]) for r in rows])      # topic blocks like "~ Notes & writing" are long
+    print(f"{'LAST':>5}  {'CREATED':<10}  {'BLOCK':<{bw}}  {'LIVE':<6}  {'ID':<8}  {'MB':>5}  TITLE  [folder]")
+    for r in rows:
+        print(f"{cs.ago(now - r['last']):>5}  {time.strftime('%Y-%m-%d', time.localtime(r['created'])):<10}  "
+              f"{r['block']:<{bw}}  {cs.live_label(r):<6}  {r['short']:<8}  {r['size'] / 1e6:>5.1f}  {r['title'][:70]}  [{r['folder']}]")
+    print(f"{len(rows)} sessions", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

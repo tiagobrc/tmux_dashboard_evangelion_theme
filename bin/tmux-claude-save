@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Snapshot the live tmux server into a restore script.
 
-Every pane is recreated in its directory; panes running Claude Code are
-relaunched with `claude --resume <sessionId>`, the ID taken from the
-~/.claude/sessions/<pid>.json registry. Run before a reboot, then run
-~/.tmux-claude-restore.sh afterwards.
+    tmux-claude-save            the default snapshot: ~/.tmux-claude-restore.sh (+ a dated copy in ~/.tmux-claude-saves/)
+    tmux-claude-save NAME       a named snapshot: ~/.tmux-claude-saves/named/NAME.sh, restored into a tmux session
+                                called NAME (NAME-<session> when the snapshot holds several); saving NAME again keeps
+                                the previous one in named/history/
+    tmux-claude-save --list     the snapshots that exist, how old they are, and which of their sessions are gone
+    tmux-claude-save --auto     (launchd) write the default snapshot only when the layout really changed
+
+Every pane is recreated in its directory; panes running Claude Code are resumed with `claude --resume <sessionId>`
+(the id comes from the ~/.claude/sessions/<pid>.json registry). The restore script checks each session when it RUNS,
+not when it was saved: a session whose transcript has been deleted since (Claude Code purges inactive ones after
+cleanupPeriodDays, 30 by default) is not resumed, and neither is one that is already running in another window
+(that would resume the conversation twice). Either way the pane gets a one-line note with the session's title,
+which the snapshot stores, and the script lists them at the end. Restore with `bash <snapshot>`.
 """
-import json, os, shlex, subprocess, sys, time
+import json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 
 HOME = Path.home()
@@ -14,7 +23,15 @@ REGISTRY = HOME / ".claude" / "sessions"
 PROJECTS = HOME / ".claude" / "projects"
 OUT = HOME / ".tmux-claude-restore.sh"
 ARCHIVE = HOME / ".tmux-claude-saves"
+NAMED = ARCHIVE / "named"
 SEP = "\x1f"
+USAGE = "usage: tmux-claude-save [NAME | --list | --auto]"
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import claude_sessions as cs
+except ImportError:
+    cs = None
 
 
 def sh(*cmd):
@@ -45,27 +62,114 @@ def has_transcript(session_id):
     return any(PROJECTS.glob(f"*/{session_id}.jsonl"))
 
 
+def ago(seconds):
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit}"
+    return "now"
+
+
+def snapshot_sessions(path):
+    """(session id, label) for every Claude window in a snapshot - new `resume` lines and the old send-keys form."""
+    found = []
+    for line in path.read_text().splitlines():
+        if line.startswith("resume "):
+            parts = shlex.split(line)
+            found.append((parts[2], parts[3] if len(parts) > 3 else ""))
+        else:
+            m = re.search(r"--resume ([0-9a-f-]{36})", line)
+            if m:
+                found.append((m.group(1), ""))
+    return found
+
+
+def list_snapshots():
+    files = [("(default)", OUT)] + [(p.stem, p) for p in sorted(NAMED.glob("*.sh"))]
+    titles = {r["id"]: r["title"] for r in cs.build()} if cs else {}
+    for label, p in files:
+        if not p.exists():
+            continue
+        sessions = snapshot_sessions(p)
+        gone = [(sid, lab) for sid, lab in sessions if not has_transcript(sid)]
+        print(f"{label:<20} saved {time.strftime('%Y-%m-%d %H:%M', time.localtime(p.stat().st_mtime))} "
+              f"({ago(time.time() - p.stat().st_mtime)} ago)  {len(sessions)} Claude windows, {len(gone)} no longer available")
+        for sid, lab in gone:
+            print(f"    gone  {sid[:8]}  {lab or titles.get(sid, '')}")
+        print(f"    restore: bash {p}")
+
+
+args = sys.argv[1:]
+AUTO, LIST = "--auto" in args, "--list" in args
+names = [a for a in args if not a.startswith("-")]
+if [a for a in args if a.startswith("-") and a not in ("--auto", "--list")] or len(names) > 1 or (names and (AUTO or LIST)):
+    sys.exit(USAGE)
+NAME = names[0] if names else None
+if NAME and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", NAME):
+    sys.exit(f"snapshot name '{NAME}': use letters, digits, . _ - (starting with a letter or digit)")
+if LIST:
+    list_snapshots()
+    sys.exit(0)
+
 fmt = SEP.join(["#{session_name}", "#{window_index}", "#{pane_index}", "#{pane_pid}",
-                "#{pane_current_path}", "#{window_layout}", "#{window_active}", "#{window_name}"])
+                "#{pane_current_path}", "#{window_layout}", "#{window_active}", "#{window_name}", "#{@pinned}"])
 panes = [l.split(SEP) for l in sh("tmux", "list-panes", "-a", "-F", fmt).splitlines()]
 kids = children_map()
+titles = {r["id"]: r["title"] for r in cs.build()} if cs else {}
+
+# tmux sessions that hold something to restore (a session with only a dashboard is not recreated)
+real_sessions = sorted({p[0] for p in panes if p[7] not in ("dash", "sessions")})
+
+
+def restored(sess):
+    """Name of the tmux session this one comes back as."""
+    if NAME:
+        return NAME if len(real_sessions) <= 1 else f"{NAME}-{sess}"
+    return f"{sess}-restored" if sess.isdigit() else sess
+
+
+def label_of(info, sid):
+    t = titles.get(sid) or info.get("name") or ""
+    return re.sub(r"[^A-Za-z0-9 ._,:/()+-]", "", t).strip()[:60]
+
+
+RESUME_FN = r'''CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+SKIPPED=()
+LIVE=$(~/.local/bin/claude-session-index --live --json 2>/dev/null | grep -o '"id": "[^"]*"' || true)
+
+# resume <pane> <session-id> <title>: resume it unless its transcript is gone or it is already running elsewhere
+resume() {
+  local pane="$1" sid="$2" title="$3" why=""
+  if ! ls ~/.claude/projects/*/"$sid".jsonl >/dev/null 2>&1; then
+    why="no longer available (its transcript was deleted)"
+  elif printf '%s' "$LIVE" | grep -q "$sid"; then
+    why="already running in another window (not resumed twice)"
+  fi
+  if [ -n "$why" ]; then
+    SKIPPED+=("${sid:0:8}  $title - $why")
+    tmux send-keys -t "$pane" -l "echo 'Claude session ${sid:0:8} ($title): $why'"
+  else
+    tmux send-keys -t "$pane" -l "$CLAUDE_BIN --resume $sid"
+  fi
+  tmux send-keys -t "$pane" Enter
+}
+'''
 
 lines = ["#!/bin/bash",
-         f"# Generated by tmux-claude-save on {time.strftime('%Y-%m-%d %H:%M:%S')}",
-         "set -e"]
-report, seen_sessions, seen_windows, active_windows, dashboards = [], set(), set(), [], []
+         f"# Generated by tmux-claude-save{' ' + NAME if NAME else ''} on {time.strftime('%Y-%m-%d %H:%M:%S')}",
+         "set -e", "", RESUME_FN.rstrip("\n")]
+report, seen_sessions, seen_windows, active_windows, dashboards, browsers = [], set(), set(), [], [], []
+q = shlex.quote
 
-for sess, win, pane, pid, path, layout, active, wname in panes:
-    if wname == "dash":  # the tmux-dashboard window: rebuilt by its own launcher, not pane by pane
-        rebuilt = f"{sess}-restored" if sess.isdigit() else sess
-        if (rebuilt, win) not in dashboards:
-            dashboards.append((rebuilt, win))
+for sess, win, pane, pid, path, layout, active, wname, pinned in panes:
+    if wname in ("dash", "sessions"):  # launcher-built windows (dashboard, session browser): rebuilt by their launcher, not pane by pane
+        bucket = dashboards if wname == "dash" else browsers
+        if (restored(sess), win) not in bucket:
+            bucket.append((restored(sess), win))
         continue
     info = find_claude(int(pid), kids)
     cwd = info["cwd"] if info else path
-    name = f"{sess}-restored" if sess.isdigit() else sess
+    name = restored(sess)
     target = f"{name}:{win}"
-    q = shlex.quote
     if sess not in seen_sessions:
         seen_sessions.add(sess)
         lines += ["", f"if tmux has-session -t {q('=' + name)} 2>/dev/null; then",
@@ -82,21 +186,25 @@ for sess, win, pane, pid, path, layout, active, wname in panes:
     if info:
         sid = info["sessionId"]
         ok = has_transcript(sid)
-        lines.append(f"tmux send-keys -t {q(target + '.' + pane)} -l {q('claude --resume ' + sid)}")
-        lines.append(f"tmux send-keys -t {q(target + '.' + pane)} Enter")
+        lines.append(f"resume {q(target + '.' + pane)} {q(sid)} {q(label_of(info, sid))}")
         report.append((target, sid, info.get("status", "?"), "" if ok else "NO TRANSCRIPT FOUND", cwd))
     else:
         report.append((target, "(plain shell)", "", "", cwd))
+    if pinned == "1" and pane == "0":      # a tab the user pinned with tmux-pin-tab
+        lines.append(f"tmux set-option -w -t {q(target)} @pinned 1")
     if active == "1":
         active_windows.append(target)
 
 lines.append("")
-lines += [f"~/.local/bin/tmux-dashboard {shlex.quote(n)} {w} -d || true" for n, w in dashboards]
-lines += [f"tmux select-window -t {shlex.quote(t)}" for t in active_windows]
-first = next(p[0] for p in panes if p[7] != "dash")
-first = f"{first}-restored" if first.isdigit() else first
-lines += ["", f'[ -n "$TMUX" ] && exec tmux switch-client -t {shlex.quote(first)}',
-          f"exec tmux attach -t {shlex.quote(first)}", ""]
+lines += [f"~/.local/bin/tmux-dashboard {q(n)} {w} -d || true" for n, w in dashboards]
+lines += [f"~/.local/bin/tmux-sessions-window {q(n)} {w} -d || true" for n, w in browsers]
+lines += [f"tmux select-window -t {q(t)}" for t in active_windows]
+first = restored(next(p[0] for p in panes if p[7] not in ("dash", "sessions")))
+lines += ["", 'if [ ${#SKIPPED[@]} -gt 0 ]; then',
+          '  echo; echo "Not resumed (${#SKIPPED[@]}):"; printf "  %s\\n" "${SKIPPED[@]}"',
+          '  [ -t 0 ] && read -r -t 20 -p "Enter to continue " _ || true', "fi",
+          f'[ -n "$TMUX" ] && exec tmux switch-client -t {q(first)}',
+          f"exec tmux attach -t {q(first)}", ""]
 
 
 def essence(text):
@@ -108,24 +216,36 @@ def essence(text):
 # --auto (launchd, every 10 min): write only when the layout really changed, and
 # never let a fresh post-reboot server with fewer Claude panes clobber the
 # pre-reboot snapshot - autosave resumes once the restore script has been run.
-if "--auto" in sys.argv and OUT.exists():
+if AUTO and OUT.exists():
     old = OUT.read_text()
     if essence(old) == essence("\n".join(lines)):
         sys.exit(0)
     server_start = int(sh("tmux", "display", "-p", "#{start_time}"))
     n_claude = sum(1 for r in report if r[1] != "(plain shell)")
-    if server_start > OUT.stat().st_mtime and n_claude < old.count("claude --resume"):
+    if server_start > OUT.stat().st_mtime and n_claude < len(snapshot_sessions(OUT)):
         print(f"{time.strftime('%F %T')} fresh tmux server, snapshot not restored yet - keeping it")
         sys.exit(0)
 
-OUT.write_text("\n".join(lines))
-OUT.chmod(0o755)
-ARCHIVE.mkdir(exist_ok=True)
-(ARCHIVE / f"restore-{time.strftime('%Y%m%d-%H%M%S')}.sh").write_text("\n".join(lines))
+body = "\n".join(lines)
+stamp = time.strftime("%Y%m%d-%H%M%S")
+if NAME:
+    dest = NAMED / f"{NAME}.sh"
+    NAMED.mkdir(parents=True, exist_ok=True)
+    if dest.exists():                        # never overwrite silently: the previous snapshot of that name is kept
+        (NAMED / "history").mkdir(exist_ok=True)
+        dest.rename(NAMED / "history" / f"{NAME}-{time.strftime('%Y%m%d-%H%M%S', time.localtime(dest.stat().st_mtime))}.sh")
+    dest.write_text(body)
+else:
+    dest = OUT
+    OUT.write_text(body)
+    ARCHIVE.mkdir(exist_ok=True)
+    (ARCHIVE / f"restore-{stamp}.sh").write_text(body)
+dest.chmod(0o755)
 
 for target, sid, status, warn, cwd in report:
     print(f"{target:16} {sid:38} {status:6} {warn} {cwd}")
-print(f"\nSaved {len(report)} panes -> {OUT}")
+print(f"\nSaved {len(report)} panes -> {dest}")
+print(f"Restore with: bash {dest}" + (f"   (comes back as tmux session '{restored(real_sessions[0])}')" if NAME and len(real_sessions) == 1 else ""))
 busy = [r[0] for r in report if r[2] == "busy"]
 shells = [r[0] for r in report if r[2] == "shell"]
 if busy:

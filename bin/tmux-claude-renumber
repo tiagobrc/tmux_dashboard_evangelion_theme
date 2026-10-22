@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Close the gaps in a tmux session's window numbers (and optionally re-sort them).
+
+After weeks of opening and closing Claude windows the indexes have holes (1 2 3 7 8 12 ...).
+This renumbers the windows of one session to base..N with no gaps, keeping the `dash`
+window in front and the `sessions` browser right behind it. Nothing is restarted: windows are only moved, so every Claude session
+keeps running and keeps its ~/.claude/sessions mapping (the registry stores @window ids,
+not indexes). The window you are looking at stays selected.
+
+    tmux-claude-renumber               current session, keep today's order, close the gaps
+    tmux-claude-renumber -n            show the plan, change nothing
+    tmux-claude-renumber -s NAME       another session (default: the one you are in)
+    tmux-claude-renumber --by title    also sort A-Z by Claude's topic title (or: path)
+"""
+import argparse, re, subprocess, sys
+
+SEP = "\x1f"
+LEAD = ("dash", "sessions")   # pinned windows, in this order
+FMT = SEP.join(["#{window_id}", "#{window_index}", "#{window_name}", "#{pane_title}", "#{pane_current_path}"])
+
+
+def tmux(*args):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"tmux {' '.join(args)}: {r.stderr.strip() or 'failed'}")
+    return r.stdout
+
+
+def windows(session):
+    out = []
+    for line in tmux("list-windows", "-t", f"={session}", "-F", FMT).splitlines():
+        wid, idx, name, title, path = line.split(SEP)
+        out.append(dict(id=wid, idx=int(idx), name=name, title=title, path=path))
+    return out
+
+
+def sort_key(by):
+    if by == "title":   # drop Claude's leading status glyph (✳ etc.) before comparing
+        return lambda w: re.sub(r"^[^A-Za-z0-9]+", "", w["title"]).lower()
+    if by == "path":
+        return lambda w: w["path"].lower()
+    return lambda w: w["idx"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Renumber a tmux session's windows without gaps.")
+    ap.add_argument("-s", "--session", help="session name (default: current)")
+    ap.add_argument("--by", choices=["index", "title", "path"], default="index",
+                    help="order of the non-dash windows (default: index = keep today's order)")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show the plan, change nothing")
+    a = ap.parse_args()
+
+    session = a.session or tmux("display-message", "-p", "#{session_name}").strip()
+    base = int(tmux("show-options", "-gv", "base-index").strip() or 0)
+    ws = sorted(windows(session), key=lambda w: w["idx"])
+    # the dashboard leads, the session browser follows it (window 1); both keep their slots whatever --by says
+    lead = [w for n in LEAD for w in ws if w["name"] == n]
+    rest = sorted((w for w in ws if w["name"] not in LEAD), key=sort_key(a.by))  # stable: ties keep index order
+    plan = [(w, base + i) for i, w in enumerate(lead + rest)]
+    moves = [(w, t) for w, t in plan if w["idx"] != t]
+
+    print(f"session {session}: {len(ws)} windows, indexes {ws[0]['idx']}..{ws[-1]['idx']}")
+    if not moves:
+        print("already contiguous in that order - nothing to do")
+        return
+    for w, t in moves:
+        label = re.sub(r"^[^A-Za-z0-9]+", "", w["title"]) or w["name"]
+        print(f"  {w['idx']:>3} -> {t:<3} {label[:60]}")
+    if a.dry_run:
+        print("dry run: nothing changed")
+        return
+
+    # Two passes through spare indexes, so a target that another window still holds never collides.
+    # (move-window -k would kill the occupant; it is deliberately not used.)
+    spare = max(w["idx"] for w in ws) + 1000
+    current = tmux("display-message", "-p", "-t", session, "#{window_id}").strip()  # moving it makes tmux hop elsewhere
+    prev = tmux("show-options", "-t", session, "-qv", "renumber-windows").strip()
+    tmux("set-option", "-t", session, "renumber-windows", "off")  # auto-renumbering would fight the temp indexes
+    try:
+        for i, (w, _) in enumerate(moves):
+            tmux("move-window", "-d", "-s", w["id"], "-t", f"={session}:{spare + i}")
+        for i, (w, t) in enumerate(moves):
+            tmux("move-window", "-d", "-s", w["id"], "-t", f"={session}:{t}")
+    finally:
+        if prev == "on":
+            tmux("set-option", "-t", session, "renumber-windows", "on")
+        tmux("select-window", "-t", current)
+
+    got = {w["id"]: w["idx"] for w in windows(session)}
+    bad = [w["id"] for w, t in plan if got.get(w["id"]) != t]
+    if bad or len(got) != len(ws):
+        sys.exit(f"check failed for {bad or 'window count'} - run `tmux list-windows -t {session}`")
+    print(f"done: {len(moves)} windows moved, {len(ws)} verified")
+
+
+if __name__ == "__main__":
+    main()

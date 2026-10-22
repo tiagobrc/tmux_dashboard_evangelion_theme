@@ -1,0 +1,39 @@
+#!/bin/bash
+# Open (or jump to) the "sessions" window: a keyboard-only browser of every Claude session (claude-session-picker).
+# It lives in the slot right after the dashboard, i.e. window 1; with no dashboard it takes the first slot.
+# usage: tmux-sessions-window [session] [window-index] [-d]   (-d: create without switching to it)
+#        tmux-sessions-window <session> --auto                (session-created hook: add it, unless the session
+#                                                              carries TMUX_NO_AUTODASH)
+# If the slot is taken (a Claude window sits there) the new window is inserted and the ones behind shift up by one.
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+sess="${1:-$(tmux display -p '#S')}"
+idx="$2"
+detach="$3"
+[ "$idx" = "-d" ] && { detach="-d"; idx=""; }   # tolerate `-d` in the index position
+
+if [ "$idx" = "--auto" ]; then
+    tmux show-environment -t "=$sess" TMUX_NO_AUTODASH 2>/dev/null | grep -q '=1' && exit 0
+    tmux list-windows -t "=$sess" -F '#W' | grep -qx sessions && exit 0
+    idx="" detach="-d"
+fi
+
+if tmux list-windows -t "=$sess" -F '#W' | grep -qx sessions; then
+    exec tmux select-window -t "=$sess:sessions"
+fi
+
+if [ -z "$idx" ]; then
+    dash=$(tmux list-windows -t "=$sess" -F '#{window_index} #{window_name}' | awk '$2=="dash"{print $1; exit}')
+    idx=$(( ${dash:--1} + 1 ))
+fi
+# a taken slot needs -b (insert before it, shifting the rest up); a free one must be addressed directly
+before=""
+tmux list-windows -t "=$sess" -F '#{window_index}' | grep -qx "$idx" && before="-b"
+win=$(tmux new-window $detach $before -P -F '#{window_id}' -t "=$sess:$idx" -n sessions -c "$HOME" claude-session-picker)
+if [ -z "$win" ]; then
+    tmux display-message "tmux-sessions-window: could not create the sessions window in $sess"
+    exit 1
+fi
+tmux set-option -w -t "$win" @pinned 1             # pinned tab on the left of the status bar (tmux-pin-tab unpins)
+tmux set-option -w -t "$win" remain-on-exit on     # a crashed picker leaves a dead pane, which the pane-died hook respawns
+dash-theme style 2>/dev/null                       # same tint as the dashboard
+exit 0
