@@ -18,7 +18,9 @@ written, so a reused pid is not mistaken for it) and, for tmux sessions, the win
 An open /handoff note whose transcript Claude Code has purged (cleanupPeriodDays) still gets a row, made from the note
 alone: r["orphan"] = True, nothing to resume - only a fresh session from the note (continue_prompt()).
 """
-import ctypes, fcntl, json, os, re, shutil, struct, subprocess, sys, threading, time
+import base64, bisect, ctypes, fcntl, hashlib, json, os, re, shutil, struct, subprocess, sys, threading, time
+from array import array
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -40,13 +42,17 @@ STATUS = HOME / ".claude" / "dash" / "status"          # claude-statusline's sna
 # continued from the browser. Tests point both elsewhere with the environment variables.
 HANDOFFS = Path(os.environ.get("CLAUDE_HANDOFFS_DIR") or HOME / ".claude" / "handoffs")
 LINKS = Path(os.environ.get("CLAUDE_DASH_LINKS") or HOME / ".claude" / "dash" / "continued.json")
-# Per-transcript API responses read so far, for spend(). v2 keeps each response's local day (v1 only its month) and lives
-# in its own file, so a dashboard still running the v1 code keeps its own index instead of fighting over this one.
-SPEND = HOME / ".claude" / "dash" / "spend-index-v2.json"
-SPEND_V1 = HOME / ".claude" / "dash" / "spend-index.json"     # read once, to carry over transcripts purged since
-SPEND_VERSION = 2
+# The spend index (see "spend" below). Each version has its own file, so a dashboard still running older code keeps its
+# own index instead of fighting over this one.
+SPEND = HOME / ".claude" / "dash" / "spend-index-v3.json"
+SPEND_BAK = HOME / ".claude" / "dash" / "spend-index-v3.json.bak"  # a day-old copy: purged transcripts' sums live only here
+SPEND_LOCK = HOME / ".claude" / "dash" / "spend-index-v3.lock"
+SPEND_V2 = HOME / ".claude" / "dash" / "spend-index-v2.json"       # read once, when there is no v3 yet
+SPEND_V1 = HOME / ".claude" / "dash" / "spend-index.json"          # ... or no v2 either: transcripts purged since
+SPEND_VERSION = 3
 SPEND_SAVE_EVERY = 600         # s: the index is written when it is older than this (whoever wrote it) ...
 SPEND_SAVE_BYTES = 64_000_000  # ... or when this process is that much transcript ahead of it: a lost write is a re-count
+FREEZE_AFTER = 3600            # s a transcript stays unwritten before its responses are folded into sums
 # API list price, $/MTok (input, output, cache read), by model-id prefix - the longest prefix wins. A cache write costs
 # 2x input with the 1-hour TTL, 1.25x with the 5-minute one. platform.claude.com/docs/en/about-claude/pricing, 2026-10-22.
 PRICES = {"claude-fable-5-1": (10, 50, 0.25), "claude-mythos-5-1": (10, 50, 0.25), "claude-fable-5": (10, 50, 1.0),
@@ -486,12 +492,15 @@ def ctx_label(c):
     return f"{size:>5} {money(c['step']) if c['warm'] else '↻' + money(c['wake'])}"
 
 
-def usd(model, t):
+def usd(model, t, long=None):
     """API list price of one response; t = [input, output, cache write 5m, cache write 1h, cache read] tokens. The prompt
-    length (t[0] + t[2] + t[3] + t[4]) picks the LONG_PRICES tier; a FAST-tagged model id costs FAST_PRICES times more."""
-    p, long, x = _rates(model)
-    if long and t[0] + t[2] + t[3] + t[4] > long[0]:
-        p = long[1]
+    length (t[0] + t[2] + t[3] + t[4]) picks the LONG_PRICES tier, unless `long` (True / False) says which: frozen sums
+    add up many responses. A FAST-tagged model id costs FAST_PRICES times more."""
+    p, lp, x = _rates(model)
+    if long is None:
+        long = bool(lp) and t[0] + t[2] + t[3] + t[4] > lp[0]
+    if long and lp:
+        p = lp[1]
     p = p or PRICES["claude-opus-5-5"]
     return x * (t[0] * p[0] + t[1] * p[1] + t[2] * p[0] * 1.25 + t[3] * p[0] * 2 + t[4] * p[2]) / 1e6
 
@@ -514,15 +523,29 @@ def _response(raw):
 
 
 # ---- spend: every API response at list price, from an incremental index of the transcripts ----
-# The index lives in memory per process, {path: {ino, off, ids: {response id: [model, day, 5 token counts]}}}: each call
-# reads each transcript on from `off`, and the file on disk is only re-read when another process replaced it (merged:
-# per transcript the entry that got further wins) and only written every SPEND_SAVE_EVERY s across all processes, or
-# when this one is SPEND_SAVE_BYTES ahead of it. Re-reading a transcript from an older offset changes nothing (a response
-# keeps its largest token counts), so a lost write only costs a re-count. Per-session totals and the deduplicated
-# response table are kept too, recomputed only for what changed.
-_sp = {"files": None, "sig": None, "ahead": 0, "dirty": False, "gen": 0, "sid": {}, "keys": {}, "sess": {}, "stale": set(),
-       "best": None, "best_gen": -1}
+# The index, {path: entry}, is kept in memory by each process that shows spend, and saved to SPEND. An entry holds the
+# transcript's inode, `off` (how far it has been read) and `ids`, the responses read since it was last frozen: {response
+# id: [model, day, 5 token counts]}, where a response written over several lines keeps its largest counts. A transcript
+# left unwritten for FREEZE_AFTER s is frozen up to `foff`: its responses become token sums by day and model ("s", for its
+# session's total; "g", for the global one, which leaves out responses another transcript already counts - stored only
+# when it differs from "s") and a 64-bit hash of each response id ("h"; "x" / "xs" = the hashes left out of "g" / "s").
+# A session resumed later is read on from `off`, its new responses added on top of the sums; a response copied into
+# another transcript (a fork, a continuation) is recognised by its hash and counted once. A transcript Claude Code purged
+# keeps its sums and its hashes - a copy of its responses can outlive it - and so does the older version of a transcript
+# that was replaced or truncated (`path#inode`, see _keep). Memory grows by 16 bytes a response (its hash here and in
+# G) instead of a whole record. Not covered: a copy with larger token counts than the frozen one turning up after it
+# froze (copies are made from the original's lines, so in practice they arrive together).
+# Each process reads the transcripts on from `off`; the file on disk is re-read only when another process replaced it,
+# and merged per transcript (the frozen part that reaches further, then the live part that reaches further). It is
+# written every SPEND_SAVE_EVERY s across all processes, or when this one is SPEND_SAVE_BYTES ahead of it, and at once
+# after a freeze. Writing and freezing hold SPEND_LOCK, and a freeze first folds in what is on disk, so no two
+# transcripts ever both count one response. Per-session totals and the table of live responses are kept too,
+# recomputed only for what changed.
+_sp = {"files": None, "sig": None, "ahead": 0, "dirty": False, "gen": 0, "fgen": 0, "sid": {}, "keys": {}, "sess": {},
+       "stale": set(), "best": None, "best_gen": -1, "agg": None, "agg_gen": -1,
+       "G": array("Q")}               # sorted hashes of the responses that some frozen transcript counts in its "g"
 _sp_lock = threading.RLock()          # the usage panel counts in a thread while it draws
+LONG = "|long"                        # model key of frozen sums priced at the LONG_PRICES tier
 
 
 def _sig(p):
@@ -534,11 +557,14 @@ def _sig(p):
 
 
 def _sid_of(key):
-    """Session id of a transcript path: <proj>/<id>.jsonl, or <proj>/<id>/... for its subagents; None outside PROJECTS."""
+    """Session id of a transcript path: <proj>/<id>.jsonl, or <proj>/<id>/... for its subagents; None outside PROJECTS.
+    An older version of a transcript (`path#inode`, see _keep) belongs to the same session."""
     sid = _sp["sid"].get(key, 0)
     if sid == 0:
         root = str(PROJECTS) + os.sep
-        parts = key[len(root):].split(os.sep) if key.startswith(root) else []
+        path, sep, ino = key.rpartition("#")
+        path = path if sep and ino.isdigit() else key
+        parts = path[len(root):].split(os.sep) if path.startswith(root) else []
         sid = _sp["sid"][key] = (parts[1][:-6] if len(parts) == 2 else parts[1]) if len(parts) >= 2 else None
     return sid
 
@@ -552,59 +578,315 @@ def _touch(key):
     _sp["gen"] += 1
 
 
-def _spend_read():
-    """The index on disk, {path: entry}; None when missing or unreadable."""
+def _hash(rid):
+    """What a frozen transcript keeps of a response id: 64 bits, the same in every process."""
+    return int.from_bytes(hashlib.blake2b(rid.encode(), digest_size=8).digest(), "little")
+
+
+def _has(a, h):
+    """h in the sorted array a."""
+    i = bisect.bisect_left(a, h)
+    return i < len(a) and a[i] == h
+
+
+def _tiers():
+    """The prompt lengths that frozen sums were split at; when they change, the transcripts still on disk are re-read."""
+    return {k: v[0] for k, v in sorted(LONG_PRICES.items())}
+
+
+def _mkey(model, t):
+    """The model key a response adds to in frozen sums: the model id, LONG appended when it was priced at the long tier."""
+    long = _rates(model)[1]
+    return model + LONG if long and t[0] + t[2] + t[3] + t[4] > long[0] else model
+
+
+def _key_usd(mkey, t):
+    """List price of frozen token sums `t` under model key `mkey`."""
+    return usd(mkey.removesuffix(LONG), t, mkey.endswith(LONG))
+
+
+def _add(sums, day, mkey, t):
+    row = sums.setdefault(day, {}).setdefault(mkey, [0, 0, 0, 0, 0])
+    for i, v in enumerate(t):
+        row[i] += v
+
+
+def _enc(files):
+    """The index as JSON: hashes as base64 of little-endian uint64s, the hash sets as sorted lists."""
+    out = {}
+    for key, c in files.items():
+        e = {k: v for k, v in c.items() if k not in ("h", "x", "xs")}
+        if "h" in c:
+            a = array("Q", c["h"])
+            if sys.byteorder == "big":
+                a.byteswap()
+            e["h"], e["x"], e["xs"] = base64.b64encode(a.tobytes()).decode(), sorted(c["x"]), sorted(c["xs"])
+        out[key] = e
+    return out
+
+
+def _dec(files):
+    """_enc undone, in place. An entry that does not parse is dropped (its transcript is read again from the start)."""
+    for key in list(files):
+        c = files[key]
+        try:
+            if not (isinstance(c, dict) and type(c["ino"]) is int and type(c["off"]) is int and isinstance(c["ids"], dict)):
+                raise TypeError
+            if "h" in c:
+                a = array("Q")
+                a.frombytes(base64.b64decode(c["h"]))
+                if sys.byteorder == "big":
+                    a.byteswap()
+                c["h"], c["x"], c["xs"] = a, set(c.get("x", ())), set(c.get("xs", ()))
+            if "s" in c and not isinstance(c["s"], dict):
+                raise TypeError
+        except (KeyError, TypeError, ValueError):
+            del files[key]
+    return files
+
+
+def _spend_read(path=None):
+    """The index in `path` (SPEND), {path: entry}; None when missing, unreadable or of another version. When the long-tier
+    thresholds changed since it was written, the frozen transcripts still on disk start again from the beginning."""
     try:
-        d = json.loads(SPEND.read_text())
-        return d["files"] if d.get("v") == SPEND_VERSION and isinstance(d.get("files"), dict) else None
+        d = json.loads((path or SPEND).read_text())
+        if d.get("v") != SPEND_VERSION or not isinstance(d.get("files"), dict):
+            return None
+        files = _dec(d["files"])
+        if d.get("tiers") != _tiers():
+            for key, c in files.items():
+                if "s" in c and os.path.exists(key):
+                    files[key] = {"ino": c["ino"], "off": 0, "ids": {}}
+        return files
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
-def _spend_migrate():
-    """A start for v2 from the v1 index: only the transcripts that are gone since (their month stands in for the day);
-    the others are re-read from the start, which is what gives their responses a day."""
+def _spend_older():
+    """A start from an older index: v2's entries as they are (they are v3 entries that were never frozen), else v1's for
+    the transcripts gone since (their month stands in for the day); every other transcript is read from the start."""
+    try:
+        d = json.loads(SPEND_V2.read_text())
+        if d.get("v") == 2 and isinstance(d.get("files"), dict):
+            return _dec(d["files"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
     try:
         d = json.loads(SPEND_V1.read_text())
         old = d["files"] if d.get("v") == 1 else {}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         old = {}
-    return {k: c for k, c in old.items() if isinstance(c, dict) and not os.path.exists(k)}
+    return _dec({k: c for k, c in old.items() if isinstance(c, dict) and not os.path.exists(k)})
+
+
+@contextmanager
+def _spend_lock(wait=2):
+    """Hold SPEND_LOCK across processes; yields False when another one kept it for `wait` s (the next call tries again)."""
+    SPEND_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(SPEND_LOCK, "a") as fh:
+        end = time.time() + wait
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > end:
+                    yield False
+                    return
+                time.sleep(0.05)
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _spend_write():
+    """Write the index; SPEND_LOCK held. The copy it replaces is kept as SPEND_BAK once a day: the sums of transcripts
+    Claude Code has purged exist nowhere else."""
+    try:
+        try:
+            keep = time.time() - SPEND_BAK.stat().st_mtime > 86400
+        except OSError:
+            keep = True
+        if keep and SPEND.exists():
+            tmp = SPEND_BAK.with_name(f"{SPEND_BAK.name}.{os.getpid()}.tmp")
+            shutil.copyfile(SPEND, tmp)
+            os.replace(tmp, SPEND_BAK)
+        tmp = SPEND.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"v": SPEND_VERSION, "tiers": _tiers(), "files": _enc(_sp["files"])}))
+        os.replace(tmp, SPEND)
+        _sp["sig"], _sp["ahead"], _sp["dirty"] = _sig(SPEND), 0, False
+    except OSError:
+        pass
+
+
+def _owned():
+    """Frozen parts changed: rebuild G, and with it the response table and the frozen totals."""
+    owned = set()
+    for c in _sp["files"].values():
+        if "h" in c:
+            owned.update(h for h in c["h"] if h not in c["x"]) if c["x"] else owned.update(c["h"])
+    _sp["G"] = array("Q", sorted(owned))
+    _sp["fgen"] += 1
+    _sp["gen"] += 1
+
+
+def _combine(c, d):
+    """One entry from two of the same transcript and inode: the frozen part that reaches further, then the live part that
+    reaches further, less the responses that frozen part holds. c itself when it has all that d has."""
+    base = d if d.get("foff", 0) > c.get("foff", 0) else c
+    live = d if d["off"] > c["off"] else c
+    if base is c and live is c:
+        return c
+    ids = live["ids"]
+    if live is not base and "h" in base:
+        ids = {rid: v for rid, v in ids.items() if not _has(base["h"], _hash(rid))}
+    return {**{k: v for k, v in base.items() if k not in ("off", "ids")}, "off": live["off"], "ids": ids}
+
+
+def _keep(key, c):
+    """Entry c of transcript `key` is an older version of it (the file was replaced or truncated): it lives on as
+    `key#inode`, like a purged transcript - its sums keep counting and its hashes keep the responses the new file
+    repeats from counting twice. Dropping it instead could leave one process counting a response through it while
+    another counts it through a transcript frozen without it. True when the frozen totals changed."""
+    if not (c["ids"] or "s" in c):
+        return False
+    old = f"{key}#{c['ino']}"
+    have = _sp["files"].get(old)
+    _sp["files"][old] = c if have is None else _combine(have, c)
+    _touch(old)
+    return "s" in c
 
 
 def _spend_merge(disk):
-    """Fold the index another process wrote into ours: per transcript the entry that read further wins (same inode;
-    else ours, which the next scan checks anyway). Sets how far ahead of the disk we are."""
-    files, ahead, mine = _sp["files"], 0, False
+    """Fold the index another process wrote into ours, per transcript with _combine. When the two sides read different
+    inodes, the one that matches the file there now (the disk's, when the file is gone or neither does, unless we keep
+    the disk's as an older version already) takes the transcript's key and the other is kept as an older version
+    (_keep). Sets how far ahead of the disk we are."""
+    files, ahead, mine, froze = _sp["files"], 0, False, False
     for key, d in disk.items():
         c = files.get(key)
-        if c is None or (d.get("ino") == c["ino"] and d.get("off", 0) > c["off"]):
+        if c is not None and d["ino"] != c["ino"]:
+            st = _sig(key)
+            mine = True
+            if st and st[1] == c["ino"] or f"{key}#{d['ino']}" in files:     # the disk's is an older version (of the
+                froze |= _keep(key, d)                                       # file there now, or one we keep already)
+                continue
+            froze |= _keep(key, files.pop(key))
+            c = None
+        if c is None:
             files[key] = d
             _touch(key)
-        else:
-            ahead += c["off"] - d.get("off", 0) if d.get("ino") == c["ino"] else c["off"]
+            froze |= "s" in d
+            continue
+        ahead += max(c["off"] - d["off"], 0)
+        mine |= c.get("foff", 0) > d.get("foff", 0)
+        new = _combine(c, d)
+        if new is not c:
+            froze |= new.get("foff", 0) != c.get("foff", 0)
+            files[key] = new
+            _touch(key)
     for key in files.keys() - disk.keys():
         ahead, mine = ahead + files[key]["off"], True
     _sp["ahead"], _sp["dirty"] = ahead, bool(ahead or mine)
+    if froze:
+        _owned()
 
 
-def _spend_files(found=None):
-    """Bring the in-memory spend index up to date with the transcripts (`found` = _transcripts(), when the caller has it)
-    and return its files: {path: {ino, off, ids}}. Call with _sp_lock held."""
+def _spend_sync():
+    """Merge the index on disk when another process wrote it since we last looked."""
     sig = _sig(SPEND)
-    if _sp["files"] is None:
-        disk = _spend_read()
-        _sp["files"] = disk if disk is not None else _spend_migrate()
-        _sp["sig"], _sp["dirty"] = sig, disk is None
-        for key in _sp["files"]:
-            _touch(key)
-    elif sig and sig != _sp["sig"]:                          # another process wrote it
+    if sig and sig != _sp["sig"]:
         disk = _spend_read()
         if disk is not None:
             _spend_merge(disk)
         _sp["sig"] = sig
-    files = _sp["files"]
-    for key, st in (found if found is not None else _transcripts()).items():
+
+
+def _freeze(keys, found):
+    """Fold the live responses of the transcripts `keys` into their sums. Oldest file first (then by path), so that a
+    response two of them hold is counted by the same one in every process - the first frozen, normally the original
+    of a fork or a continuation - at the largest counts any live transcript holds of it (of this session, for "s"): one
+    copy may have stopped at a placeholder line, and nothing frozen can grow."""
+    files, G, new_g, new_s = _sp["files"], _sp["G"], set(), {}
+    held_by = {}
+    for k, c in files.items():
+        for rid, (model, day, *t) in c["ids"].items():
+            held_by.setdefault(rid, []).append((_sid_of(k), t))
+    for key in sorted(keys, key=lambda k: (getattr(found.get(k), "st_birthtime", 0), k)):
+        c, sid = files[key], _sid_of(key)
+        held = [files[k] for k in (_sp["keys"].get(sid, ()) if sid else (key,)) if "h" in files[k]]
+        own = c.get("h", array("Q"))
+        s = c.get("s", {})
+        g = c["g"] if "g" in c else {day: {m: list(t) for m, t in row.items()} for day, row in s.items()}
+        x, xs, hs, new_ss = set(c.get("x", ())), set(c.get("xs", ())), set(), new_s.setdefault(sid, set())
+        for rid, (model, day, *t) in c["ids"].items():
+            h = _hash(rid)
+            if _has(own, h) or h in hs:
+                continue                   # frozen here already: lines of one response on both sides of a freeze
+            hs.add(h)
+            copies = held_by[rid]
+            if h in new_ss or any(_has(f["h"], h) and h not in f["xs"] for f in held):
+                xs.add(h)                  # another transcript of this session counts it
+            else:
+                top = [max(v) for v in zip(*(ct for csid, ct in copies if csid == sid))] if len(copies) > 1 else t
+                _add(s, day, _mkey(model, top), top)
+                new_ss.add(h)
+            if h in new_g or _has(G, h):
+                x.add(h)                   # a transcript frozen before counts it
+            else:
+                top = [max(v) for v in zip(*(ct for csid, ct in copies))] if len(copies) > 1 else t
+                _add(g, day, _mkey(model, top), top)
+                new_g.add(h)
+        c.update(s=s, h=array("Q", sorted(hs.union(own))), x=x, xs=xs, foff=c["off"], ids={})
+        if g == s:
+            c.pop("g", None)
+        else:
+            c["g"] = g
+        _touch(key)
+    _owned()
+
+
+def _spend_freeze(found):
+    """Freeze every transcript unwritten for FREEZE_AFTER s, or gone, under SPEND_LOCK and on top of what is on disk;
+    then write the index at once, so the next process to freeze starts from it."""
+    now = time.time()
+
+    def due():
+        return [k for k, c in _sp["files"].items()
+                if c["ids"] and (k not in found or now - found[k].st_mtime >= FREEZE_AFTER)]
+    if not due():
+        return
+    try:
+        with _spend_lock() as held:
+            if held:
+                _spend_sync()
+                keys = due()
+                if keys:
+                    _freeze(keys, found)
+                    _spend_write()
+    except OSError:
+        pass
+
+
+def _spend_files(found=None):
+    """Bring the in-memory spend index up to date with the transcripts (`found` = _transcripts(), when the caller has it)
+    and return its files: {path: entry}. Call with _sp_lock held."""
+    if found is None:
+        found = _transcripts()
+    if _sp["files"] is None:
+        sig = _sig(SPEND)                                   # before the read: a write after it is merged next call
+        disk = _spend_read()
+        files = disk if disk is not None else _spend_read(SPEND_BAK)
+        _sp["files"] = files if files is not None else _spend_older()
+        _sp["sig"], _sp["dirty"] = sig if disk is not None else None, disk is None
+        for key in _sp["files"]:
+            _touch(key)
+        _owned()
+    else:
+        _spend_sync()
+    files, reset = _sp["files"], False
+    for key, st in found.items():
         c = files.get(key)
         if c and c["ino"] == st.st_ino and c["off"] > st.st_size:  # maybe only grown since `found` was listed
             try:
@@ -612,6 +894,8 @@ def _spend_files(found=None):
             except OSError:
                 continue
         if not c or c["ino"] != st.st_ino or c["off"] > st.st_size:          # new, replaced or truncated: from the start
+            if c:
+                reset |= _keep(key, c)
             c = files[key] = {"ino": st.st_ino, "off": 0, "ids": {}}
             _touch(key)
             _sp["dirty"] = True
@@ -639,25 +923,29 @@ def _spend_files(found=None):
             _sp["dirty"] = True
             if got_any:
                 _touch(key)
-    due = _sp["dirty"] and (sig is None or _sp["ahead"] >= SPEND_SAVE_BYTES or time.time() - sig[0] / 1e9 >= SPEND_SAVE_EVERY)
-    if due and _sig(SPEND) == sig:                            # not if another process wrote it during this scan
+    if reset:
+        _owned()
+    _spend_freeze(found)
+    sig = _sig(SPEND)
+    if _sp["dirty"] and (sig is None or _sp["ahead"] >= SPEND_SAVE_BYTES or time.time() - sig[0] / 1e9 >= SPEND_SAVE_EVERY):
         try:
-            SPEND.parent.mkdir(parents=True, exist_ok=True)
-            tmp = SPEND.with_suffix(f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"v": SPEND_VERSION, "files": files}))
-            os.replace(tmp, SPEND)
-            _sp["sig"], _sp["ahead"], _sp["dirty"] = _sig(SPEND), 0, False
+            with _spend_lock() as held:
+                if held and _sig(SPEND) in (None, _sp["sig"]):   # not if another process wrote it since we last merged
+                    _spend_write()
         except OSError:
             pass
     return files
 
 
 def _best():
-    """{response id: [model, day, tokens, usd, sessions]}: every API response once, at its largest token counts, with the
-    sessions whose transcripts hold it. Rebuilt only after the index changed. Call with _sp_lock held."""
+    """{response id: [model, day, tokens, usd, sessions]}: every live response that no frozen transcript counts, once, at
+    its largest token counts, with the sessions whose live transcripts hold it. Rebuilt only after the index changed.
+    Call with _sp_lock held."""
     if _sp["best_gen"] != _sp["gen"]:
-        best = {}
+        best, G = {}, _sp["G"]
         for key, c in _sp["files"].items():
+            if not c["ids"]:
+                continue
             sid = _sid_of(key)
             for rid, (model, day, *t) in c["ids"].items():
                 old = best.get(rid)
@@ -667,10 +955,31 @@ def _best():
                         old[4].add(sid)
                 else:
                     best[rid] = [model, day, t, 0.0, {sid} if sid else set()]
+        if G:
+            best = {rid: b for rid, b in best.items() if not _has(G, _hash(rid))}
         for b in best.values():
             b[3] = usd(b[0], b[2])
         _sp["best"], _sp["best_gen"] = best, _sp["gen"]
     return _sp["best"]
+
+
+def _agg():
+    """The frozen sums at list price: {"g": {(day, model key): usd}, "a": {(day, sessionId): usd} (the same, by the
+    session whose transcript counts it), "s": {sessionId: usd}}. Rebuilt after a freeze or a merge. _sp_lock held."""
+    if _sp["agg_gen"] != _sp["fgen"]:
+        g, a, s = {}, {}, {}
+        for key, c in _sp["files"].items():
+            if "s" not in c:
+                continue
+            sid = _sid_of(key)
+            for day, row in c.get("g", c["s"]).items():
+                for mk, t in row.items():
+                    v = _key_usd(mk, t)
+                    g[day, mk] = g.get((day, mk), 0.0) + v
+                    a[day, sid] = a.get((day, sid), 0.0) + v
+            s[sid] = s.get(sid, 0.0) + sum(_key_usd(mk, t) for row in c["s"].values() for mk, t in row.items())
+        _sp["agg"], _sp["agg_gen"] = {"g": g, "a": a, "s": s}, _sp["fgen"]
+    return _sp["agg"]
 
 
 def spend():
@@ -682,6 +991,8 @@ def spend():
     with _sp_lock:
         _spend_files()
         by = {}
+        for (day, mk), cost in _agg()["g"].items():
+            by[day[:7]] = by.get(day[:7], 0) + cost
         for model, day, t, cost, sids in _best().values():
             by[day[:7]] = by.get(day[:7], 0) + cost
     return by
@@ -693,13 +1004,21 @@ def spend_by_session(found=None):
     Only the sessions whose transcripts changed since the last call are summed again."""
     with _sp_lock:
         files = _spend_files(found)
+        frozen = _agg()["s"]
         for sid in _sp["stale"]:
+            keys = _sp["keys"].get(sid, ())
+            held = [files[k] for k in keys if "h" in files[k]]
             d = {}
-            for key in _sp["keys"].get(sid, ()):
+            for key in keys:
                 for rid, (model, day, *t) in files[key]["ids"].items():
                     old = d.get(rid)
                     d[rid] = (model, list(map(max, old[1], t)) if old else t)
-            _sp["sess"][sid] = sum(usd(m, t) for m, t in d.values())
+            live = 0.0
+            for rid, (m, t) in d.items():
+                h = _hash(rid) if held else 0
+                if not any(_has(f["h"], h) and h not in f["xs"] for f in held):
+                    live += usd(m, t)
+            _sp["sess"][sid] = frozen.get(sid, 0.0) + live
         _sp["stale"].clear()
         return dict(_sp["sess"])
 
@@ -723,7 +1042,8 @@ def week_days(week):
 def spend_breakdown(first=None, last=None, rows=None):
     """Spend of the API responses made on local days `first`..`last` ('YYYY-MM-DD', both included; None = open), each
     response once: {"total", "by_day", "by_week", "by_month", "by_model", "by_block", "by_session"} - every value usd,
-    every breakdown adding up to "total". A response two sessions hold (a fork) is split evenly between them. Blocks are
+    every breakdown adding up to "total". A response two sessions hold (a fork, a continuation) counts for the one whose
+    transcript was frozen first with it - normally the session that made it - and is split evenly while none is. Blocks are
     the rows' home_block (from build(), called when `rows` is None); a session with no row - its transcript is gone -
     counts as "(gone)". Models are API ids, " fast" appended for fast mode. Responses whose day is unknown ("?", or only
     the month for transcripts purged before v2) count only when both bounds are None."""
@@ -736,20 +1056,36 @@ def spend_breakdown(first=None, last=None, rows=None):
         out[k][key] = out[k].get(key, 0.0) + v
     with _sp_lock:
         _spend_files()
-        best = _best()
-        for model, day, t, cost, sids in best.values():
-            if (first or last) and (len(day) != 10 or (first and day < first) or (last and day > last)):
-                continue
+        agg, best = _agg(), _best()
+
+    def inside(day):
+        return not (first or last) or (len(day) == 10 and not (first and day < first) and not (last and day > last))
+    for (day, mk), cost in agg["g"].items():
+        if inside(day):
+            model = mk.removesuffix(LONG)
             out["total"] += cost
             add("by_month", day[:7], cost)
             if len(day) == 10:
                 add("by_day", day, cost)
                 add("by_week", _week(day), cost)
             add("by_model", model.removesuffix(FAST) + (" fast" if model.endswith(FAST) else ""), cost)
-            share = cost / (len(sids) or 1)
-            for sid in sids or (None,):
-                add("by_session", sid or "?", share)
-                add("by_block", block.get(sid, "(gone)"), share)
+    for (day, sid), cost in agg["a"].items():
+        if inside(day):
+            add("by_session", sid or "?", cost)
+            add("by_block", block.get(sid, "(gone)"), cost)
+    for model, day, t, cost, sids in best.values():
+        if not inside(day):
+            continue
+        out["total"] += cost
+        add("by_month", day[:7], cost)
+        if len(day) == 10:
+            add("by_day", day, cost)
+            add("by_week", _week(day), cost)
+        add("by_model", model.removesuffix(FAST) + (" fast" if model.endswith(FAST) else ""), cost)
+        share = cost / (len(sids) or 1)
+        for sid in sids or (None,):
+            add("by_session", sid or "?", share)
+            add("by_block", block.get(sid, "(gone)"), share)
     return out
 
 

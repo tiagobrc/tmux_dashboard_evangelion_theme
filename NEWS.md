@@ -1,5 +1,38 @@
 # tmux-dashboard news
 
+## 2026-10-22: spend index v3, sums instead of every response
+
+- **What changed.** A transcript left unwritten for an hour (`FREEZE_AFTER`) is folded into token sums by day and
+  model, plus an 8-byte hash of each response id. The index no longer keeps every response.
+  - A session resumed later is read on from where it stopped, and its new responses are added on top of the sums.
+  - A response copied into another transcript (a fork, a continuation, a subagent file) is recognised by its hash and
+    counted once, at its largest token counts.
+  - A transcript Claude Code purged keeps its sums and its hashes, since a copy of its responses can outlive it. So
+    does the older version of a transcript that was replaced or truncated (kept as `path#inode`).
+- **Memory.** Per process: 22.6 MB before, now 1.8 MB with everything frozen, plus the responses of the sessions
+  written in the last hour (7 MB on a busy afternoon). It still grows with history, but by 16 bytes a response (its
+  hash) instead of about 900: about 4 MB a year per process at October's rate, instead of about 240 MB. The index file
+  went from 2.3 MB to 0.9 MB, and a panel's first count after a restart from 4.8 s to 0.1 s.
+- **Same numbers.** Monthly totals, every session's total, and spend by day, week and model are identical to v2 to the
+  cent. Tested on a snapshot of every transcript: a fresh build, a migration from v2, everything frozen,
+  nothing frozen, a second process, a session resumed after freezing (with a copy from another session), two
+  processes merging each other's writes, a purged transcript, a changed long-prompt threshold, and three processes
+  starting at once. An independent review added a fuzzer: three processes, random writes, idling, freezes, merges,
+  lock timeouts, restarts, purges and replaced files, checked against the old code after every step: 2,000 runs, all identical.
+- **Changed on purpose.** In `spend_breakdown` (today's top session, `claude-session-index --weekly`), a response two
+  sessions hold now counts for the oldest transcript, the session that made the API call; it used to be split evenly.
+  On one day's data that moved a few dollars between sessions.
+- **Safety.**
+  - Writes and freezes hold `~/.claude/dash/spend-index-v3.lock`, and a freeze first folds in what other processes
+    wrote, so two transcripts never both count one response.
+  - A day-old copy, `spend-index-v3.json.bak`, is kept: the sums of purged transcripts exist only in the index.
+  - When a long-prompt price threshold changes, the frozen transcripts still on disk are read again.
+- **Upgrade.** The first run starts from `spend-index-v2.json`, so no transcript is read again. After that,
+  `spend-index-v2.json` is not used and can go to a holding folder with v1.
+- **Transcripts kept a year.** The recommended `cleanupPeriodDays` is now 365, not 3650. At October's rate that is
+  about 1.3 GB of transcripts a month, about 16 GB a year. The index only reads transcripts; it never changes or
+  deletes them.
+
 ## 2026-10-22: efficiency, layout and session-browser review
 
 ### Efficiency
@@ -136,11 +169,11 @@
   v2. `~/.claude/dash/visible.json` was replaced by `shared/visible-<server>.json`. Neither is used again, and both
   can be moved to a holding folder.
 - **Keeping transcripts.** Claude Code deletes transcripts after `cleanupPeriodDays`, 30 days by default.
-  `"cleanupPeriodDays": 3650` in `~/.claude/settings.json` keeps them; `install.sh` does not set it.
+  `"cleanupPeriodDays": 365` in `~/.claude/settings.json` keeps them a year; `install.sh` does not set it.
 - **New settings** in `~/.config/tmux-dashboard/config`: `NUDGE_MIN`, `MONTH_BUDGET_USD`, `PARK_MODEL` and
   `WEEKLY_EXPORT_DIR`. See `config/dashboard.conf.example`.
-- **Known issue.** The spend index lives in each process that shows spend: the sessions panel, the usage panel and
-  the browser, once per dashboard.
+- **Known issue, fixed by spend index v3 (above).** The spend index lives in each process that shows spend: the
+  sessions panel, the usage panel and the browser, once per dashboard.
   - On 2026-10-22 it took 21.6 MB per process for 23.8k API responses, about 0.9 KB per response.
   - It grows with your history. At the October rate, about 20k responses a month, that is about 240 MB per process
     after a year.
