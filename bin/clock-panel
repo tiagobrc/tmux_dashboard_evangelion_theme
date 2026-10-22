@@ -3,25 +3,18 @@
 
 Replaces tmux's built-in clock-mode, which quits on any keypress or click in
 its pane. Adapts to the pane: 5-row digits when there is room (with the date
-underneath if rows allow), otherwise a single text line.
+underneath if rows allow), otherwise a single text line. Draws once a minute (and at
+once on a resize), and not at all while no client shows the window.
 """
-import json, shutil, sys, time
-from pathlib import Path
+import os, shutil, signal, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dashlib
 
 FONT = {"0": "111101101101111", "1": "001001001001001", "2": "111001111100111", "3": "111001111001111",
         "4": "101101111001001", "5": "111100111001111", "6": "111100111101111", "7": "111001001001001",
         "8": "111101111101111", "9": "111101111001111", ":": "000010000010000"}
 CYAN, DIM, OFF = "\033[36m", "\033[2m", "\033[0m"
-THEME = Path.home() / ".local" / "share" / "dash-theme" / "colours.json"   # written by dash-theme
-
-
-def digit_colour():
-    """The active theme's accent as a truecolor escape; plain cyan when no theme is active."""
-    try:
-        h = json.loads(THEME.read_text())["accent"].lstrip("#")
-        return "\033[38;2;%d;%d;%dm" % (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
-    except (OSError, ValueError, KeyError, IndexError):
-        return CYAN
 
 
 def big(text):
@@ -42,7 +35,7 @@ def render():
     now = time.localtime()
     date = time.strftime("%a %d %b %Y", now)
     digits = big(time.strftime("%H:%M", now))
-    colour = digit_colour()
+    colour = dashlib.theme("accent", CYAN)   # the active dash-theme's accent; plain cyan without one
     if rows >= 5 and cols >= len(digits[0]) + 2:
         body = [f"{colour}{l.center(cols - 1)}{OFF}" for l in digits]
         if rows >= 7:
@@ -57,12 +50,17 @@ def render():
 if "--once" in sys.argv:
     print(render())
     sys.exit(0)
+screen = dashlib.Screen()
+
+
 sys.stdout.write("\033[?25l\033[2J")
+wake = dashlib.winch_fd()              # a resize redraws at once, not at the next minute
 try:
     while True:
-        sys.stdout.write(render())
-        sys.stdout.flush()
-        time.sleep(1)
+        screen.show(dashlib.safe(render))   # an unchanged frame is not rewritten
+        # The digits change once a minute: sleep to just past the next one, but 5 s at most - the timer stops while
+        # the Mac sleeps, and after a wake the old minute would otherwise stay up for up to a minute.
+        dashlib.wait(min(5, 60.05 - time.time() % 60), wake)
 except KeyboardInterrupt:
     pass
 finally:

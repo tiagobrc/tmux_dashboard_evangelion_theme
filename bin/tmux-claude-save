@@ -134,7 +134,8 @@ def label_of(info, sid):
 
 RESUME_FN = r'''CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 SKIPPED=()
-LIVE=$(~/.local/bin/claude-session-index --live --json 2>/dev/null | grep -o '"id": "[^"]*"' || true)
+# --all: a running session that is folded (continued in another) or still empty is running all the same
+LIVE=$(~/.local/bin/claude-session-index --live --all --json 2>/dev/null | grep -o '"id": "[^"]*"' || true)
 
 # resume <pane> <session-id> <title>: resume it unless its transcript is gone or it is already running elsewhere
 resume() {

@@ -9,8 +9,14 @@
     claude-session-index --all           also the stubs
     claude-session-index -n 20           first 20 rows
     claude-session-index --json          machine-readable rows
+    claude-session-index --weekly        this ISO week as Markdown: open threads and their next step, the 5 costliest
+                                         sessions, spend by block and by model against the week before. Printed, or
+                                         written to <DIR>/Claude week <YYYY-Www>.md with --out DIR or the setting
+                                         WEEKLY_EXPORT_DIR (empty = print); --week 2026-W42 (or "last") for another week
 """
-import argparse, json, os, sys, time
+import argparse, json, os, re, sys, time
+from datetime import date, timedelta
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import claude_sessions as cs
 
@@ -24,7 +30,13 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--block", help="only this block (experiment code, Other, ~, or a topic such as '~ Lookups')")
     ap.add_argument("--print-topics", action="store_true", help="print the topic rules in use (save as ~/.config/tmux-dashboard/topics to edit)")
+    ap.add_argument("--weekly", action="store_true", help="this week's summary as Markdown (open threads, costliest sessions, spend by block and model)")
+    ap.add_argument("--week", help="with --weekly: an ISO week such as 2026-W42, or 'last' (default: this week, so far)")
+    ap.add_argument("--out", metavar="DIR", help="with --weekly: write '<DIR>/Claude week <YYYY-Www>.md' instead of printing (default: WEEKLY_EXPORT_DIR)")
     a = ap.parse_args()
+
+    if a.weekly:
+        return weekly(a)
 
     if a.print_topics:
         print(cs.TOPICS_FILE.read_text() if cs.TOPICS_FILE.exists() else cs.DEFAULT_TOPICS, end="")
@@ -52,6 +64,30 @@ def main():
         print(f"{cs.ago(now - r['last']):>5}  {time.strftime('%Y-%m-%d', time.localtime(r['created'])):<10}  "
               f"{r['block']:<{bw}}  {cs.live_label(r):<6}  {r['short']:<8}  {r['size'] / 1e6:>5.1f}  {r['title'][:70]}  [{r['folder']}]")
     print(f"{len(rows)} sessions", file=sys.stderr)
+
+
+def weekly(a):
+    week = a.week
+    if week == "last":
+        week = cs._week((date.today() - timedelta(days=7)).isoformat())
+    elif week:
+        try:
+            if not re.fullmatch(r"\d{4}-W\d{2}", week):
+                raise ValueError
+            cs.week_days(week)                                # W00 / W54 pass the pattern but are no week
+        except ValueError:
+            sys.exit(f"--week {week}: use an ISO week such as 2026-W42, or 'last'")
+    week, text = cs.weekly_markdown(week)
+    out = a.out or os.path.expanduser(cs.setting("WEEKLY_EXPORT_DIR", ""))
+    if not out:
+        print(text, end="")
+        return
+    path = Path(out) / f"Claude week {week}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+    print(f"wrote {path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -5,11 +5,14 @@ Polls `ssh cluster` (the alias keeps a ControlMaster open, so no new logins):
 squeue every 60 s, sacct every 5 min - sacct is slow and hits the accounting DB.
 All dashboards share one cache (~/.claude/dash/slurm.json) behind a lock file,
 so two monitors do not mean two pollers. Fetching runs in a thread; the pane
-keeps redrawing from the cache meanwhile.
+keeps redrawing from the cache meanwhile, and neither runs while nobody looks.
+A failed squeue or sacct keeps the last good rows on screen, under the error.
 """
 import json, os, re, shutil, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dashlib
 
 
 def conf(key, default=""):
@@ -28,6 +31,8 @@ def conf(key, default=""):
 
 HOST, USER = conf("SLURM_HOST"), conf("SLURM_USER")
 SQUEUE_EVERY, SACCT_EVERY = 60, 300
+RETRY = 30                      # s to the next try after a failure, instead of every tick
+SSH_TIMEOUT = 90                # s; then the ControlMaster is closed, since one left dead by the Mac sleeping hangs every call
 DASH = Path.home() / ".claude" / "dash"
 CACHE, LOCK = DASH / "slurm.json", DASH / "slurm.lock"
 DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
@@ -43,11 +48,13 @@ def read_cache():
 
 
 def fetch():
-    """Refresh whatever is stale. One ssh call; at most one fetcher at a time across panels."""
+    """Refresh whatever is stale. One ssh call; at most one fetcher at a time across panels. Each section reports its
+    own exit code (@@RC): only a section that worked replaces its rows and its time, so a failure (controller down,
+    accounting DB away) keeps the last good rows and sets the error line instead of showing an empty queue."""
     cache, now = read_cache(), time.time()
-    want_q = now - cache.get("squeue_at", 0) > SQUEUE_EVERY
-    want_a = now - cache.get("sacct_at", 0) > SACCT_EVERY
-    if not (want_q or want_a):
+    want_q = now - cache.get("squeue_at", 0) > SQUEUE_EVERY and now >= cache.get("squeue_retry", 0)
+    want_a = now - cache.get("sacct_at", 0) > SACCT_EVERY and now >= cache.get("sacct_retry", 0)
+    if not (want_q or want_a) or now < cache.get("retry_at", 0):
         return
     DASH.mkdir(parents=True, exist_ok=True)
     try:
@@ -57,33 +64,57 @@ def fetch():
     except OSError:
         return
     try:
-        parts = []
+        wanted, parts = [], []
         if want_q:
-            parts.append(f"echo @@Q; squeue -u {USER} -h -o '%i|%j|%T|%M|%l|%P|%R'")
+            wanted.append(("Q", "squeue"))
+            parts.append(f"echo @@Q; squeue -u {USER} -h -o '%i|%j|%T|%M|%l|%P|%R' 2>&1; echo \"@@RC $?\"")
         if want_a:
-            parts.append(f"echo @@A; sacct -u {USER} -X -n -P -S now-24hours -o JobID,JobName%40,State,Elapsed,End,Partition")
+            wanted.append(("A", "sacct"))
+            parts.append(f"echo @@A; sacct -u {USER} -X -n -P -S now-24hours -o JobID,JobName%40,State,Elapsed,End,Partition"
+                         f" 2>&1; echo \"@@RC $?\"")
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", HOST, "; ".join(parts)],
-                           capture_output=True, text=True, timeout=90)
-        if r.returncode != 0 and "@@" not in r.stdout:
-            cache["error"] = (r.stderr.strip().splitlines() or ["ssh failed"])[-1][:120]
-            cache["squeue_at"] = now - SQUEUE_EVERY + 30  # retry in 30 s, not every tick
-        else:
-            section = None
-            rows = {"Q": [], "A": []}
-            for line in r.stdout.splitlines():
-                if line.startswith("@@"):
-                    section = line[2:3]
-                elif section and "|" in line:
-                    rows[section].append(line.split("|"))
-            if want_q:
-                cache["squeue"], cache["squeue_at"] = rows["Q"], now
-            if want_a:
-                cache["sacct"], cache["sacct_at"] = rows["A"], now
-            cache["error"] = None
+                           capture_output=True, text=True, timeout=SSH_TIMEOUT)
+        section, rows, rc, said = None, {"Q": [], "A": []}, {}, {}
+        for line in r.stdout.splitlines():
+            if line.startswith("@@RC "):
+                rc[section] = int(line[5:]) if line[5:].strip().isdigit() else -1
+            elif line.startswith("@@"):
+                section = line[2:3]
+            elif section and "|" in line:
+                rows[section].append(line.split("|"))
+            elif section and line.strip():
+                said[section] = line.strip()              # squeue / sacct's own message (stderr is folded into stdout)
+        ssh_err = (r.stderr.strip().splitlines() or [f"ssh exit {r.returncode}"])[-1]
+        errors = []
+        for sec, name in wanted:
+            key, every = ("squeue", SQUEUE_EVERY) if sec == "Q" else ("sacct", SACCT_EVERY)
+            if rc.get(sec) == 0:
+                cache[key], cache[key + "_at"], cache[key + "_retry"], cache[key + "_error"] = rows[sec], now, 0, None
+            elif sec in rc:                               # it ran and failed (accounting DB down ...): retry at half its pace
+                cache[key + "_retry"] = now + max(RETRY, every // 2)
+                cache[key + "_error"] = f"{name}: " + said.get(sec, f"exit {rc[sec]}").removeprefix(f"{name}: ")
+                errors.append(cache[key + "_error"])
+            else:                                         # ssh failed before the section ran
+                errors.append(ssh_err)
+        asked = {"squeue" if sec == "Q" else "sacct" for sec, _ in wanted}
+        errors += [cache[k + "_error"] for k in ("squeue", "sacct") if k not in asked and cache.get(k + "_error")]   # still failing, in backoff
+        cache["error"] = " · ".join(dict.fromkeys(errors))[:200] or None
+    except subprocess.TimeoutExpired:
+        cache["error"] = f"no reply from {HOST} in {SSH_TIMEOUT} s"
+        try:   # a slow sacct on a healthy connection is no reason to drop it: probe it first
+            subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, "true"], capture_output=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            cache["error"] += ": the next try opens a fresh ssh connection"
+            try:   # stop, not exit: the shared master stops taking new sessions, while your open `ssh cluster` shells stay up
+                subprocess.run(["ssh", "-O", "stop", HOST], capture_output=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        except (OSError, subprocess.SubprocessError):
+            pass
     except (OSError, subprocess.SubprocessError) as e:
         cache["error"] = f"{type(e).__name__}: cluster unreachable"
-        cache["squeue_at"] = now - SQUEUE_EVERY + 30
     finally:
+        cache["retry_at"] = time.time() + RETRY if cache.get("error") else 0   # from now: a timeout took 90 s
         fd, tmp = tempfile.mkstemp(dir=DASH, prefix=".tmp-")
         with os.fdopen(fd, "w") as fh:
             json.dump(cache, fh)
@@ -124,8 +155,7 @@ def render():
     ok = sum(1 for r in done if r[2].startswith("COMPLETED"))
     bad = sum(1 for r in done if r[2].startswith(BAD))
     cancelled = sum(1 for r in done if r[2].startswith("CANCELLED"))
-    age = now - c.get("squeue_at", 0) if c.get("squeue_at") else None
-    fresh = f"updated {int(age)}s ago" if age is not None and age < 3600 else "waiting for first reply…"
+    fresh = f"updated {dashlib.dur(now - c['squeue_at'])} ago" if c.get("squeue_at") else "waiting for first reply…"
     wide = cols >= 120
     head = (f"{BOLD} HPC · SLURM{OFF}" + (f"{DIM}  {USER}@{HOST}{OFF}" if wide else "") + f"   {CYAN}▶ {running} running{OFF} · "
             f"{YELLOW}◷ {len(queue) - running} queued{OFF}   {DIM}24h:{OFF} {GREEN}✔ {ok}{OFF}  "
@@ -133,7 +163,8 @@ def render():
     out = [head]
     if c.get("error"):
         out.append(f" {RED}{clip(c['error'], cols - 2)}{OFF}")
-        out.append(f"{DIM} showing the last good data · `ssh {HOST}` once in any window re-opens the connection{OFF}")
+        out.append(f"{DIM} showing the last good data" + ("" if c["error"].startswith(("squeue:", "sacct:")) else
+                   f" · `ssh {HOST}` once in any window re-opens the connection") + OFF)   # ssh itself failed
     name_w = max(10, min(36, cols - (70 if cols >= 100 else 58)))
     show_part = cols >= 100   # partition column only when there is room
     for r in sorted(queue, key=lambda r: (r[2] != "RUNNING", r[0])):
@@ -167,14 +198,14 @@ if "--once" in sys.argv:
     fetch()
     print(render())
     sys.exit(0)
+screen = dashlib.Screen()
 sys.stdout.write("\033[?25l\033[2J")
 try:
     while True:
         if not any(t.name == "fetch" for t in threading.enumerate()):
             threading.Thread(target=fetch, name="fetch", daemon=True).start()
-        sys.stdout.write(render())
-        sys.stdout.flush()
-        time.sleep(5)
+        screen.show(dashlib.safe(render))
+        dashlib.wait(5)
 except KeyboardInterrupt:
     pass
 finally:

@@ -25,7 +25,7 @@ case "$cmd" in
         tmux display-message -d 1500 "tab ${name}: $([ $v = 1 ] && echo pinned || echo unpinned)"
         ;;
     list)
-        tmux list-windows -a -F '#{@pinned} #{session_name}:#{window_index} #{window_name}' | awk '$1==1{print $2, $3}'
+        tmux list-windows -a -F '#{@pinned} #{session_name}:#{window_index} #{window_name}' | sed -n 's/^1 //p'   # whole name, spaces too
         ;;
     defaults)
         tmux list-windows -a -F '#{window_id} #{window_name} #{@pinned}' | while read -r id name pinned; do

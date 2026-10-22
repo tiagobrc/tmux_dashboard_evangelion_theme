@@ -5,21 +5,46 @@ http://127.0.0.1:8765/  picks the "dash" window whose shape matches the screen
 (portrait monitor -> the tall dashboard, landscape -> the wide one), captures
 every pane with its colours (`tmux capture-pane -e`) and lays the panes out on
 a character grid. Binds to localhost only, accepts no input, and only does any
-work while a page is actually polling it.
+work while a page is actually polling it. Each frame it serves touches
+dashlib.WEB_BEAT, so the panels keep drawing while nobody looks at tmux itself.
+Colours follow dash-theme: its terminal palette (PAINT) and the dash window's
+own text colour (window-style); the built-in palette while no theme is active.
 """
-import html, json, re, subprocess, sys
+import html, json, os, re, subprocess, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 8765
+import dashlib
+
+PORT = int(os.environ.get("DASH_WEB_PORT", 8765))    # another port lets a test copy run beside the launchd one
 BASE16 = ["#15161b", "#e0566b", "#7ec86b", "#e2b455", "#5b9cf0", "#c07be0", "#4fc3c8", "#c9ccd3",
           "#5c6170", "#ff7b8e", "#9fe08d", "#f5cf78", "#82b6ff", "#d9a0f2", "#7fe0e4", "#ffffff"]
+DEFAULT = {"ansi": BASE16, "fg": "#c9ccd3", "bg": "#000000"}
+PAINT = dashlib.THEME.with_name("paint.esc")        # written by dash-theme: iTerm SetColors escapes, empty = no theme
+ANSI_KEYS = [p + c for p in ("", "br_") for c in ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")]
+DASH_ONLY = "#{?#{==:#{window_name},dash},%s,}"   # other windows print an empty line: names (spaces and all) are never parsed
 SGR = re.compile(r"\x1b\[([0-9;:]*)m")
 OTHER_ESC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[A-Za-ln-z]|\x1b[()][0-9A-B]|\x0f|\x0e")
+_pal = {}
 
 
-def xterm(n):
+def palette():
+    """The 16 ANSI colours, text and background dash-theme paints the terminals with, re-read only when PAINT changes;
+    DEFAULT when it is missing, empty or incomplete."""
+    try:
+        key = PAINT.stat().st_mtime_ns
+        if _pal.get("key") != key:
+            c = {k: "#" + v.lower() for k, v in re.findall(r"SetColors=(\w+)=([0-9a-fA-F]{6})", PAINT.read_text())}
+            ansi = [c.get(k) for k in ANSI_KEYS]
+            _pal.update(key=key, pal={"ansi": ansi, "fg": c["fg"], "bg": c["bg"]}
+                        if all(ansi) and "fg" in c and "bg" in c else DEFAULT)
+        return _pal["pal"]
+    except OSError:
+        return DEFAULT
+
+
+def xterm(n, ansi):
     if n < 16:
-        return BASE16[n]
+        return ansi[n]
     if n < 232:
         n -= 16
         return "#%02x%02x%02x" % tuple(0 if v == 0 else 55 + v * 40 for v in (n // 36, n // 6 % 6, n % 6))
@@ -30,11 +55,11 @@ def tmux(*args):
     return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=10).stdout
 
 
-def ansi_to_html(text):
-    out, st = [], {"fg": None, "bg": None, "bold": False, "dim": False, "rev": False, "ul": False}
+def ansi_to_html(text, pal):
+    out, st, ansi = [], {"fg": None, "bg": None, "bold": False, "dim": False, "rev": False, "ul": False}, pal["ansi"]
 
     def open_span():
-        fg, bg = (st["bg"] or "#0b0c10", st["fg"] or "#c9ccd3") if st["rev"] else (st["fg"], st["bg"])
+        fg, bg = (st["bg"] or pal["bg"], st["fg"] or pal["text"]) if st["rev"] else (st["fg"], st["bg"])
         css = ([f"color:{fg}"] if fg else []) + ([f"background:{bg}"] if bg else []) \
             + (["font-weight:700"] if st["bold"] else []) + (["opacity:.5"] if st["dim"] else []) \
             + (["text-decoration:underline"] if st["ul"] else [])
@@ -58,16 +83,16 @@ def ansi_to_html(text):
             elif c == 22: st["bold"] = st["dim"] = False
             elif c == 24: st["ul"] = False
             elif c == 27: st["rev"] = False
-            elif 30 <= c <= 37: st["fg"] = BASE16[c - 30]
-            elif 90 <= c <= 97: st["fg"] = BASE16[c - 82]
+            elif 30 <= c <= 37: st["fg"] = ansi[c - 30]
+            elif 90 <= c <= 97: st["fg"] = ansi[c - 82]
             elif c == 39: st["fg"] = None
-            elif 40 <= c <= 47: st["bg"] = BASE16[c - 40]
-            elif 100 <= c <= 107: st["bg"] = BASE16[c - 92]
+            elif 40 <= c <= 47: st["bg"] = ansi[c - 40]
+            elif 100 <= c <= 107: st["bg"] = ansi[c - 92]
             elif c == 49: st["bg"] = None
             elif c in (38, 48) and i + 1 < len(codes):
                 key = "fg" if c == 38 else "bg"
                 if codes[i + 1] == 5 and i + 2 < len(codes):
-                    st[key] = xterm(codes[i + 2]); i += 2
+                    st[key] = xterm(codes[i + 2], ansi); i += 2
                 elif codes[i + 1] == 2 and i + 4 < len(codes):
                     st[key] = "#%02x%02x%02x" % tuple(codes[i + 2:i + 5]); i += 4
             i += 1
@@ -77,13 +102,22 @@ def ansi_to_html(text):
 
 
 def frame(shape):
-    wins = [l.split() for l in tmux("list-windows", "-a", "-F",
-            "#{window_id} #{window_name} #{window_width} #{window_height}").splitlines()]
-    dash = [(w, int(W), int(H)) for w, name, W, H in wins if name == "dash"]
+    try:
+        dashlib.WEB_BEAT.touch()      # panels pause while no tmux client shows them; a polling page counts as looking
+    except OSError:
+        pass
+    pal = palette()
+    wins = [l.split(" ", 3) for l in tmux("list-windows", "-a", "-F", DASH_ONLY %
+            "#{window_id} #{window_width} #{window_height} #{window-style}").splitlines() if l]
+    dash = [(w, int(W), int(H), style) for w, W, H, style in wins]
     if not dash:
-        return {"cols": 40, "rows": 3, "panes": [{"x": 1, "y": 1, "w": 38, "h": 1, "html": "no tmux dashboard window is open"}]}
+        return {"cols": 40, "rows": 3, "fg": pal["fg"], "bg": pal["bg"],
+                "panes": [{"x": 1, "y": 1, "w": 38, "h": 1, "html": "no tmux dashboard window is open"}]}
     fits = [d for d in dash if (d[1] / d[2] < 2.0) == (shape == "tall")]
-    wid, W, H = (fits or dash)[0]
+    wid, W, H, style = (fits or dash)[0]
+    # default text: the dash window's own colour (dash-theme style: orange under MAGI), else the palette's
+    text = re.search(r"\bfg=(#[0-9a-fA-F]{6})\b", style)
+    pal = dict(pal, text=text[1] if text else pal["fg"])
     panes = [l.split() for l in tmux("list-panes", "-t", wid, "-F",
              "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height}").splitlines()]
     args = []
@@ -93,8 +127,8 @@ def frame(shape):
     out = []
     for (pid, x, y, w, h), chunk in zip(panes, chunks):
         lines = OTHER_ESC.sub("", chunk).split("\n")[:int(h)]
-        out.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "html": ansi_to_html("\n".join(lines))})
-    return {"cols": W, "rows": H, "panes": out}
+        out.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "html": ansi_to_html("\n".join(lines), pal)})
+    return {"cols": W, "rows": H, "fg": pal["text"], "bg": pal["bg"], "panes": out}
 
 
 PAGE = """<!doctype html><meta charset=utf-8><title>dashboard</title>
@@ -120,6 +154,7 @@ async function tick(){
     grid.style.fontSize = size + 'px'; grid.style.lineHeight = lh + 'px';
     grid.style.width = f.cols * cw + 'px'; grid.style.height = f.rows * lh + 'px';
     grid.style.left = (innerWidth - f.cols * cw) / 2 + 'px'; grid.style.top = (innerHeight - f.rows * lh) / 2 + 'px';
+    grid.style.color = f.fg; document.body.style.background = f.bg;          // the active dash-theme
     grid.innerHTML = f.panes.map(p => `<div class=pane style="left:${p.x*cw}px;top:${p.y*lh}px;width:${p.w*cw}px;height:${p.h*lh}px">${p.html}</div>`).join('');
   }catch(e){ grid.textContent = 'dashboard server not reachable'; }
 }
@@ -154,6 +189,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if "--frame" in sys.argv:
         f = frame("tall" if "tall" in sys.argv else "wide")
-        print(f["cols"], f["rows"], [(p["x"], p["y"], p["w"], p["h"], len(p["html"])) for p in f["panes"]])
+        print(f["cols"], f["rows"], f["fg"], f["bg"], [(p["x"], p["y"], p["w"], p["h"], len(p["html"])) for p in f["panes"]])
         sys.exit(0)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

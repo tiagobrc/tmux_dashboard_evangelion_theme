@@ -1,34 +1,57 @@
 #!/usr/bin/env python3
 """Fit every tmux "dash" window to the shape of the screen it is on.
 
-wide  (landscape)               tall  (portrait monitor)
-+---------+---------------+     +----------------------+
-|         |   sessions    |     |         btop         |
-|  btop   +---------------+     +----------------------+
-|         |     usage     |     |        slurm         |
-|         +---------------+     +-----------+----------+
-+---------+    sensors    |     | sessions  |  usage   |
-|  slurm  +---------+-----+     +-----------+----------+
-|         |  clock  |spot-|     |  sensors  |  clock   |
-|         +---------+ ify |     |           +----------+
-|         | weather |     |     |           | weather  |
-+---------+---------+-----+     |           +----------+
-                                |           | spotify  |
-                                +-----------+----------+
-
-Run with no arguments (tmux `window-resized` hook, and tmux-dashboard after it
-builds a window). Panes are found by the command they run (ROLES), in the order btop, slurm, sessions, usage, sensors, clock,
-weather, spotify, [local jobs]; one custom layout string per shape is enough, tmux checks its checksum.
-The optional 9th pane (local-jobs-panel) sits beside slurm in tall mode and under it in wide mode.
+wide  (landscape, btop keeps 80 columns)        tall  (portrait monitor)
++-----------------+--------------+              +----------------------+
+|                 |   sessions   |              |  btop (24-30 rows)   |
+|  btop           |   (>= 12     |              +-----------+----------+
+|  (24-30 rows)   |   rows)      |              |   slurm   |local jobs|
+|                 +--------------+              +-----------+----------+
+|                 |    usage     |              | sessions  |  usage   |
++--------+--------+--------------+              | (all the  |          |
+| slurm  | local  |   sensors    |              |  rows     |          |
+|        | jobs   +-------+------+              |  left)    |          |
+|        |        | clock |spoti-|              +-----------+----------+
+|        |        |       |fy    |              |  sensors  |  clock   |
+|        |        +-------+------+              |           +----------+
+|        |        |   weather    |              |           | weather  |
++--------+--------+--------------+              |           +----------+
+                                                |           | spotify  |
+                                                +-----------+----------+
+compact  (btop cannot get 80x24 next to the     narrow  (< 96 columns: one column)
+rest: it is parked on one row)                  +----------------------+
++-----------------+--------------+              |  sessions            |
+|  sessions       |    usage     |              +-----------------+----+
+|                 +--------------+              |  usage          |clk.|
+|                 |   sensors    |              +----------+------+----+
++--------+--------+-------+------+              |  slurm   |local jobs |
+| slurm  | local  | clock |spoti-|              +----------+-----------+
+|        | jobs   +-------+------+              |  sensors             |
++--------+--------+   weather    |              +-----------+----------+
+| btop (1 row)    |              |              |  weather  | spotify  |
++-----------------+--------------+              +-----------+----------+
+                                                |  btop (1 row)        |
+                                                +----------------------+
+Run with no arguments (tmux `window-resized` hook, and tmux-dashboard after it builds a window). The first layout that
+fits is used, tall tried first on a portrait screen; a window under 40x14 is left as tmux sized it (nine panes cannot all
+get a readable row there, and the hook re-fits it once it grows). Panes are found by the command they run (ROLES); the
+optional 9th, local-jobs-panel, sits beside SLURM. One custom layout string per shape is enough, tmux checks its checksum.
 """
-import subprocess
+import fcntl, subprocess
+from pathlib import Path
 
 ROLES = ["dash-btop", "slurm-panel", "claude-sessions-panel", "claude-usage-panel", "sensors-panel",
-         "clock-panel", "weather-panel", "spotify-panel", "local-jobs-panel"]   # pane order the layouts assume
-SENSORS_H, CLOCK_H = 10, 7   # rows the widgets need
+         "clock-panel", "weather-panel", "spotify-panel", "local-jobs-panel"]
+BTOP, SLURM, SESS, USAGE, SENS, CLOCK, WX, SPOT, JOBS = range(9)
+BTOP_W, BTOP_H = 80, 24      # btop 1.4.7 refuses to draw below 80x24
+BTOP_MAX = 30                # btop rows beyond this go to the lists
+SESS_H = 12                  # rows promised to the sessions list (9 sessions + header + legend) wherever they fit
+SENSORS_H = 10               # rows the sensors widget needs
 PANEL_W = (56, 64)           # min / max width of the right-hand column in wide mode
-BTOP_MIN_H = 24             # btop 1.4.7 refuses to draw below 80x24
+CLOCK_W = 32                 # the clock's big digits need 32 columns (and 5 rows)
 TALL_BELOW = 2.0             # width/height under this (cells are ~2x taller than wide) = portrait
+LOCK = Path.home() / ".claude" / "dash" / "layout.lock"
+DASH_ONLY = "#{?#{==:#{window_name},dash},%s,}"   # other windows print an empty line: names are never parsed
 
 
 def tmux(*args):
@@ -42,91 +65,146 @@ def checksum(layout):
     return f"{c:04x}"
 
 
-def wide(W, H, p):
-    jobs = p[8] if len(p) > 8 else None
-    right = min(max(PANEL_W[0], round(W * 0.40)), PANEL_W[1])
-    left, x = W - 1 - right, W - right
-    roomy = H >= 46
-    # bottom-right row holds clock over weather (left) and Spotify (right)
-    usage, slurm, clock_h, wx_h = (13, 11, 5, 3) if roomy else (7, 8, 3, 3)   # big digits need 5 rows
-    bottom = clock_h + wx_h + 1
-    jobs_h = 6 if jobs else 0
-    if jobs:
-        slurm = max(6, slurm - 3)
-    btop = H - slurm - jobs_h - (2 if jobs else 1)
-    side = bool(jobs) and btop < BTOP_MIN_H      # short screen: SLURM and local jobs share one row so btop keeps its 24 rows
-    if side:
-        btop = BTOP_MIN_H
-        slurm, jobs_h = H - btop - 1, 0
-    sess = H - usage - SENSORS_H - bottom - 3
-    y_use, y_sens, y_bot = sess + 1, sess + usage + 2, sess + usage + SENSORS_H + 3
-    sw = 22 if roomy else 20                      # Spotify keeps a narrow strip; clock + weather get the rest
-    cw = right - sw - 1
-    jobs_cell = f",{left}x{jobs_h},0,{btop + slurm + 2},{jobs}" if jobs and not side else ""
-    slurm_cell = f"{left}x{slurm},0,{btop + 1},{p[1]}"
-    if side:
-        jw = 24
-        slurm_cell = (f"{left}x{slurm},0,{btop + 1}{{{left - jw - 1}x{slurm},0,{btop + 1},{p[1]},"
-                      f"{jw}x{slurm},{left - jw},{btop + 1},{jobs}}}")
-    return (f"{W}x{H},0,0{{{left}x{H},0,0[{left}x{btop},0,0,{p[0]},{slurm_cell}{jobs_cell}],"
-            f"{right}x{H},{x},0["
-            f"{right}x{sess},{x},0,{p[2]},"
-            f"{right}x{usage},{x},{y_use},{p[3]},"
-            f"{right}x{SENSORS_H},{x},{y_sens},{p[4]},"
-            f"{right}x{bottom},{x},{y_bot}{{{cw}x{bottom},{x},{y_bot}[{cw}x{clock_h},{x},{y_bot},{p[5]},"
-            f"{cw}x{wx_h},{x},{y_bot + clock_h + 1},{p[6]}],"
-            f"{right - cw - 1}x{bottom},{x + cw + 1},{y_bot},{p[7]}}}]}}")
+def share(total, mins, steps):
+    """Split `total` rows (or columns) between neighbours, one border between each: every pane starts at its minimum
+    (`mins`, in order), then each (pane, size) in `steps` grows that pane towards `size` while room is left; the last
+    step's pane also takes whatever remains. None when even the minimums do not fit."""
+    got = dict(mins)
+    left = total - sum(got.values()) - (len(got) - 1)
+    if left < 0:
+        return None
+    for k, want in steps:
+        add = min(max(want - got[k], 0), left)
+        got[k] += add
+        left -= add
+    got[steps[-1][0]] += left
+    return got
 
 
-def tall(W, H, p):
-    mid = max(8, min(20, H // 5))
-    slurm = max(8, min(12, H // 8))
-    bottom = 13                                  # sensors | [clock 3, weather 4, spotify 4]
-    top = H - slurm - mid - bottom - 3
-    half = W // 2
-    sens_w = min(58, half)
-    y_slurm, y_mid, y_bot = top + 1, top + slurm + 2, top + slurm + mid + 3
-    rw, ch, wh = W - sens_w - 1, 5, 4           # clock keeps its big digits; Spotify gets the 2 rows left
-    if len(p) > 8:
-        sw = max(60, W * 11 // 20)               # SLURM keeps the wider half; its columns need ~60
-        sw = min(sw, W - 30)
-        row = (f"{W}x{slurm},0,{y_slurm}{{{sw}x{slurm},0,{y_slurm},{p[1]},"
-               f"{W - sw - 1}x{slurm},{sw + 1},{y_slurm},{p[8]}}},")
-    else:
-        row = f"{W}x{slurm},0,{y_slurm},{p[1]},"
-    return (f"{W}x{H},0,0[{W}x{top},0,0,{p[0]},"
-            f"{row}"
-            f"{W}x{mid},0,{y_mid}{{{half}x{mid},0,{y_mid},{p[2]},"
-            f"{W - half - 1}x{mid},{half + 1},{y_mid},{p[3]}}},"
-            f"{W}x{bottom},0,{y_bot}{{{sens_w}x{bottom},0,{y_bot},{p[4]},"
-            f"{rw}x{bottom},{sens_w + 1},{y_bot}[{rw}x{ch},{sens_w + 1},{y_bot},{p[5]},"
-            f"{rw}x{wh},{sens_w + 1},{y_bot + ch + 1},{p[6]},"
-            f"{rw}x{bottom - ch - wh - 2},{sens_w + 1},{y_bot + ch + wh + 2},{p[7]}]}}]")
+def lay(t, w, h, x, y, ids, cells):
+    """Layout string of tree `t` in a w x h cell at x,y. A tree is a role, or ("{" side by side | "[" stacked,
+    [(size, tree), ...]); the last child takes what is left, a None child is left out. The roles go to `cells` in the
+    order tmux fills them."""
+    if isinstance(t, int):
+        cells.append(t)
+        return f"{w}x{h},{x},{y},{ids[t]}"
+    axis, kids = t[0], [k for k in t[1] if k[1] is not None]
+    if len(kids) == 1:
+        return lay(kids[0][1], w, h, x, y, ids, cells)
+    out, pos, end = [], x if axis == "{" else y, (x + w if axis == "{" else y + h)
+    for i, (size, kid) in enumerate(kids):
+        size = end - pos if i == len(kids) - 1 else size
+        out.append(lay(kid, size, h, pos, y, ids, cells) if axis == "{" else lay(kid, w, size, x, pos, ids, cells))
+        pos += size + 1
+    return f"{w}x{h},{x},{y}{axis}{','.join(out)}{'}' if axis == '{' else ']'}"
 
 
-for line in tmux("list-windows", "-a", "-F", "#{window_id} #{window_name} #{window_width} #{window_height}").splitlines():
-    wid, name, W, H = line.split()
-    W, H = int(W), int(H)
-    if name != "dash" or W < 60 or H < 28:
-        continue
-    by_role = {}
-    for row in tmux("list-panes", "-t", wid, "-F", "#{pane_id}\t#{pane_start_command}").splitlines():
-        pid, _, cmd = row.partition("\t")
-        for i, role in enumerate(ROLES):
-            if role in cmd:
-                by_role[i] = pid.replace("%", "")
-    if not all(i in by_role for i in range(8)):
-        continue
-    panes = [by_role[i] for i in sorted(by_role)]
-    # tmux fills a custom layout's cells in window index order and ignores the ids in it, so put the panes in role order
-    now = tmux("list-panes", "-t", wid, "-F", "#{pane_id}").replace("%", "").split()
-    order = panes[:2] + panes[8:] + panes[2:8]       # local jobs is the 3rd cell in both layouts' traversal
-    for i, want in enumerate(order):
-        if now[i] != want:
-            subprocess.run(["tmux", "swap-pane", "-d", "-s", f"%{want}", "-t", f"%{now[i]}"])
-            j = now.index(want)
-            now[i], now[j] = now[j], now[i]
-    body = tall(W, H, panes) if W / H < TALL_BELOW else wide(W, H, panes)
-    layout = f"{checksum(body)},{body}"
-    if tmux("display", "-p", "-t", wid, "#{window_layout}") != layout:
-        subprocess.run(["tmux", "select-layout", "-t", wid, layout])
+def corner(w, rows):
+    """Clock beside Spotify, over weather. The clock's row is `rows` high; Spotify needs 2-4, so it shares that row."""
+    cw = CLOCK_W if w - CLOCK_W - 1 >= 14 else w // 2
+    return ("[", [(rows, ("{", [(cw, CLOCK), (None, SPOT)])), (None, WX)])
+
+
+def wide(W, H, jobs):
+    right = min(max(PANEL_W[0], round(W * 0.40)), PANEL_W[1], W - 1 - BTOP_W)
+    left = W - 1 - right
+    r = share(H, {SESS: 3, USAGE: 3, SENS: 4, CLOCK: 2, WX: 2},
+              [(SESS, SESS_H), (USAGE, 4), (SENS, SENSORS_H), (WX, 3), (CLOCK, 5), (SESS, 30), (USAGE, 13), (SESS, H)])
+    if right < PANEL_W[0] or H < BTOP_H + 4 or not r:
+        return None
+    btop = min(max(H - 11, BTOP_H), BTOP_MAX)    # SLURM + local jobs get 10 rows, or down to 3 on a short screen
+    return ("{", [(left, ("[", [(btop, BTOP), (None, ("{", [(left - 1 - left // 2, SLURM), (None, jobs)]))])),
+                  (None, ("[", [(r[SESS], SESS), (r[USAGE], USAGE), (r[SENS], SENS),
+                                (None, corner(right, r[CLOCK]))]))])
+
+
+def tall(W, H, jobs):
+    # rows named by their first pane: SESS = sessions | usage, SENS = sensors | clock, weather, Spotify
+    r = share(H, {BTOP: BTOP_H, SLURM: 3, SESS: SESS_H, SENS: 8},
+              [(SENS, 10), (SLURM, 6), (SENS, 13), (SLURM, 8), (BTOP, BTOP_MAX), (SLURM, 12), (SESS, H)])
+    if W < BTOP_W or not r:
+        return None
+    sens_w = min(58, W // 2)
+    b = share(r[SENS], {CLOCK: 2, WX: 2, SPOT: 2}, [(CLOCK, 5), (WX, 4), (WX, H)])
+    sw = min(max(60, W * 11 // 20), W - 37)      # SLURM keeps the wider half (its columns need ~60), local jobs >= 36
+    return ("[", [(r[BTOP], BTOP),
+                  (r[SLURM], ("{", [(sw, SLURM), (None, jobs)])),
+                  (r[SESS], ("{", [(W // 2, SESS), (None, USAGE)])),
+                  (None, ("{", [(sens_w, SENS), (None, ("[", [(b[CLOCK], CLOCK), (b[WX], WX), (None, SPOT)]))]))])
+
+
+def compact(W, H, jobs):
+    # btop cannot have 80x24 beside a usable sessions list: it is parked on one row ("terminal size too small")
+    right = min(PANEL_W[0], W - 1 - 56)           # the sessions side keeps >= 56 columns
+    left = W - 1 - right
+    l = share(H, {SESS: 3, SLURM: 2, BTOP: 1}, [(SESS, SESS_H), (SLURM, 6), (SESS, 30), (SLURM, 10), (SESS, H)])
+    clock = [(CLOCK, 5)] if right - CLOCK_W - 1 >= 14 else []
+    r = share(H, {USAGE: 3, SENS: 4, CLOCK: 2, WX: 2}, [(USAGE, 4), (SENS, SENSORS_H), (WX, 3)] + clock
+              + [(USAGE, 13), (WX, H)])
+    if W < 96 or not (l and r):
+        return None
+    return ("{", [(left, ("[", [(l[SESS], SESS), (l[SLURM], ("{", [(left - 1 - left // 2, SLURM), (None, jobs)])),
+                                (None, BTOP)])),
+                  (None, ("[", [(r[USAGE], USAGE), (r[SENS], SENS), (None, corner(right, r[CLOCK]))]))])
+
+
+def narrow(W, H, jobs):
+    # one column; what has no room left keeps a single row (btop always)
+    r = share(H, {SESS: 3, USAGE: 2, SLURM: 1, SENS: 1, WX: 1, BTOP: 1},
+              [(SESS, SESS_H), (USAGE, 4), (SLURM, 4), (SENS, 6), (WX, 3), (SESS, 30), (SLURM, 10), (SENS, SENSORS_H),
+               (SESS, H)])
+    if W < 40 or not r:
+        return None
+    return ("[", [(r[SESS], SESS), (r[USAGE], ("{", [(W - 21, USAGE), (None, CLOCK)])),
+                  (r[SLURM], ("{", [(W - 1 - W // 2, SLURM), (None, jobs)])), (r[SENS], SENS),
+                  (r[WX], ("{", [(W - 25, WX), (None, SPOT)])), (None, BTOP)])
+
+
+def fit(W, H, jobs):
+    order = (tall, wide) if W / H < TALL_BELOW else (wide, tall)
+    for shape in (*order, compact, narrow):
+        if t := shape(W, H, JOBS if jobs else None):
+            return t
+    return None
+
+
+def main():
+    for line in tmux("list-windows", "-a", "-F", DASH_ONLY % "#{window_id} #{window_width} #{window_height}").splitlines():
+        if not line:
+            continue
+        wid, W, H = line.split()
+        W, H = int(W), int(H)
+        by_role = {}
+        for row in tmux("list-panes", "-t", wid, "-F", "#{pane_id}\t#{pane_start_command}").splitlines():
+            pid, _, cmd = row.partition("\t")
+            for i, role in enumerate(ROLES):
+                if role in cmd:
+                    by_role[i] = pid.replace("%", "")
+        tree = fit(W, H, JOBS in by_role) if all(i in by_role for i in range(8)) else None
+        if not tree:
+            continue
+        cells = []
+        body = lay(tree, W, H, 0, 0, by_role, cells)
+        now = tmux("list-panes", "-t", wid, "-F", "#{pane_id}").replace("%", "").split()
+        if len(now) != len(cells):                   # a pane the dashboard does not know: leave the window alone
+            continue
+        # tmux fills a custom layout's cells in window index order and ignores the ids in it, so put the panes in the
+        # order the chosen layout visits its cells (btop is not always first: dash-theme finds it by its command)
+        for i, want in enumerate(by_role[c] for c in cells):
+            if now[i] != want:
+                subprocess.run(["tmux", "swap-pane", "-d", "-s", f"%{want}", "-t", f"%{now[i]}"])
+                j = now.index(want)
+                now[i], now[j] = now[j], now[i]
+        layout = f"{checksum(body)},{body}"
+        if tmux("display", "-p", "-t", wid, "#{window_layout}") != layout:
+            subprocess.run(["tmux", "select-layout", "-t", wid, layout])
+
+
+# a burst of window-resized hooks runs one at a time, so their pane swaps cannot interleave
+try:
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+except OSError:
+    pass
+main()

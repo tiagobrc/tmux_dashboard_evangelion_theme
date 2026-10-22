@@ -2,13 +2,20 @@
 """Spotify now-playing widget for the tmux dashboard, with playback keys.
 
 Talks to the Spotify desktop app through AppleScript (what the tmux-spotify
-plugins do), polling every 3 s and ticking the progress bar locally in between.
+plugins do) and ticks the progress bar locally in between. One poll serves every
+dashboard (dashlib.shared): every PLAY_POLL s while playing, or as the track ends if
+sooner; every IDLE_POLL s while paused, stopped or closed; none while nobody looks.
+A key here, or spotify-ctl from a tmux binding, polls at once.
 Never launches Spotify: if the app is closed the widget just says so.
 Keys, when this pane has focus:  space play/pause · n next · p previous · + / - volume
 """
 import os, select, shutil, subprocess, sys, termios, time, tty
 
-POLL = 3.0
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dashlib
+
+PLAY_POLL, IDLE_POLL = 15, 30   # s between AppleScript polls while playing / otherwise
+SHARE = "spotify"               # dashlib.shared name; spotify-ctl deletes its file to make the panels poll now
 DIM, BOLD, OFF, GREEN = "\033[2m", "\033[1m", "\033[0m", "\033[32m"
 QUERY = '''if application "Spotify" is running then
   tell application "Spotify"
@@ -36,13 +43,24 @@ def tell(command):
 def poll():
     parts = osa(QUERY).split("\t")
     if len(parts) < 7:
-        return {"state": parts[0] or "unavailable"}
+        return {"state": parts[0] or "unavailable", "at": time.time()}
     try:
         return {"state": parts[0], "title": parts[1], "artist": parts[2], "album": parts[3],
                 "duration": float(parts[4]) / 1000, "position": float(parts[5].replace(",", ".")),
                 "volume": int(float(parts[6])), "at": time.time()}
     except ValueError:
-        return {"state": "unavailable"}
+        return {"state": "unavailable", "at": time.time()}
+
+
+def max_age(s):
+    """How long a poll stays good: PLAY_POLL s while playing, less if the track ends first (then a second past its end,
+    so the next poll finds the next track); IDLE_POLL s otherwise."""
+    if s.get("state") != "playing":
+        return IDLE_POLL
+    left = s["duration"] - s["position"]
+    if s["duration"] <= 0 or left <= 0:   # no length (a stream), or stuck past the end: the normal pace, not every second
+        return PLAY_POLL
+    return max(5.0, min(PLAY_POLL, left + 1))
 
 
 def clip(text, n):
@@ -81,14 +99,14 @@ if "--once" in sys.argv:
 
 fd = sys.stdin.fileno()
 saved = termios.tcgetattr(fd) if os.isatty(fd) else None
+screen = dashlib.Screen()
 sys.stdout.write("\033[?25l\033[2J")
 try:
     if saved:
         tty.setcbreak(fd)
-    state, last = poll(), time.time()
+    state = dashlib.shared(SHARE, IDLE_POLL, poll)
     while True:
-        sys.stdout.write(render(state))
-        sys.stdout.flush()
+        screen.show(dashlib.safe(render, state))
         ready = select.select([fd], [], [], 1.0)[0] if saved else (time.sleep(1.0) or [])
         if ready:
             key = os.read(fd, 1).decode(errors="ignore")
@@ -103,9 +121,11 @@ try:
             else:
                 continue
             time.sleep(0.3)  # let Spotify settle before re-reading
-            state, last = poll(), time.time()
-        elif time.time() - last >= POLL:
-            state, last = poll(), time.time()
+            state = dashlib.shared(SHARE, 0, poll)    # max age 0: poll now, and the other dashboards pick it up
+        else:
+            dashlib.wait(0)                           # nobody looking: no ticks, no polls until someone is
+            # each tick reads the shared result (cheap); AppleScript runs only once it is older than this state allows
+            state = dashlib.shared(SHARE, max_age(state), poll)
 except KeyboardInterrupt:
     pass
 finally:

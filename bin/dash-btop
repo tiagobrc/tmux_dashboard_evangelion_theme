@@ -4,12 +4,22 @@
 # little CPU per refresh, so "CPU time did not move for 2 minutes" is a reliable freeze signal.
 export PATH="/opt/homebrew/bin:$PATH"
 trap 'kill "$pid" 2>/dev/null; exit 0' INT TERM HUP
+# A one-second wait without forking `sleep` 60 times a minute: `read -t` on a FIFO this shell holds open for both
+# reading and writing never gets data or EOF, so it always times out. /bin/bash is 3.2 here: no {fd} allocation and
+# integer timeouts only, and `exec 9<> <(:)` is refused on macOS. Without the FIFO, fall back to sleep.
+fifo="${TMPDIR:-/tmp}/dash-btop.$$"
+if mkfifo "$fifo" 2>/dev/null && exec 9<>"$fifo"; then
+    nap() { read -t "$1" -u 9; }
+else
+    nap() { sleep "$1"; }
+fi
+rm -f "$fifo"
 while :; do
-    btop "$@" < /dev/tty &   # bash gives background jobs /dev/null as stdin; btop needs the pane's tty
+    btop "$@" < /dev/tty 9>&- &   # bash gives background jobs /dev/null as stdin; btop needs the pane's tty
     pid=$!
     last="" stale=0 ticks=0
     while kill -0 "$pid" 2>/dev/null; do
-        sleep 1                                   # notice an exit within a second...
+        nap 1                                     # notice an exit within a second...
         ticks=$((ticks + 1))
         [ $((ticks % ${DASH_BTOP_CHECK:-30})) -eq 0 ] || continue   # ...but only test for a freeze every 30 s
         now=$(ps -o time= -p "$pid" 2>/dev/null)
@@ -18,5 +28,5 @@ while :; do
         [ "$stale" -ge 4 ] && kill -9 "$pid" 2>/dev/null
     done
     wait "$pid" 2>/dev/null
-    sleep 1
+    nap 1
 done

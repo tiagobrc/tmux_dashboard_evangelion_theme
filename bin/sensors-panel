@@ -2,14 +2,18 @@
 """Temperature / fan / power widget for the tmux dashboard window.
 
 Streams `macmon pipe` (sudoless Apple Silicon sensors) and redraws on every
-sample: die temperatures with sparkline history, fan speed, power draw.
+sample: die temperatures with sparkline history, fan speed, power draw. While no
+client shows the window, macmon is stopped and nothing is read.
 """
-import json, re, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, time
 from collections import deque
 
-INTERVAL_MS = 2000
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dashlib
+
+INTERVAL_MS = 4000
 TEMP_RANGE = (30.0, 100.0)  # fixed sparkline scale, so its height means the same thing every day
-ISMC_EVERY = 3  # read the SMC every Nth macmon sample (one read is ~0.3 s)
+ISMC_EVERY = 15  # s between SMC reads (one read is ~0.3 s)
 BLOCKS = " ▁▂▃▄▅▆▇█"
 # iSMC reports ~160 temperature keys on an M3 Ultra; show the hottest sensor of each zone.
 # Watermark keys ("... Max"/"... Min") and fixed calibration references are left out.
@@ -77,8 +81,9 @@ def render(s, hist, zones=None):
         hist["sys_power"].append(sysw)
         peak = max(max(hist["sys_power"]), 60.0)
         out.append(f" Pwr {BOLD}{sysw:5.1f} W{OFF} {DIM}{spark(hist['sys_power'], 0, peak, w)}{OFF}")
-        out.append(f"{DIM}     cpu {s.get('cpu_power', 0):.1f} · gpu {s.get('gpu_power', 0):.1f}"
-                   f" · ram {s.get('ram_power', 0):.1f} W   peak {max(hist['sys_power']):.0f} W{OFF}")
+        cpu, gpu, ram = (s.get(k) or 0 for k in ("cpu_power", "gpu_power", "ram_power"))
+        if any(round(v, 1) for v in (cpu, gpu, ram)):   # macmon reads 0 for all three on this Mac: no row of zeros
+            out.append(f"{DIM}     cpu {cpu:.1f} · gpu {gpu:.1f} · ram {ram:.1f} W   peak {max(hist['sys_power']):.0f} W{OFF}")
     if zones:
         title = f" hottest per zone · {zones['_total'][1]} SMC sensors "
         out.append(f"{DIM}{title.center(cols - 1, '─')}{OFF}")
@@ -99,28 +104,40 @@ def stream():
                 continue
     finally:
         proc.terminate()
+        try:
+            proc.wait(2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 hist = {k: deque(maxlen=400) for k in ("cpu_temp_avg", "gpu_temp_avg", "sys_power")}
 once = "--once" in sys.argv
-zones = None
+zones, zones_at = None, 0
+screen = dashlib.Screen()
 if not once:
     sys.stdout.write("\033[?25l\033[2J")
 try:
     while True:
+        hidden = False
         try:
-            for n, sample in enumerate(stream()):
-                if n % ISMC_EVERY == 0:
-                    zones = read_zones()
-                sys.stdout.write(render(sample, hist, zones))
-                sys.stdout.flush()
+            samples = stream()
+            for sample in samples:
+                if time.time() - zones_at >= ISMC_EVERY:
+                    zones, zones_at = read_zones(), time.time()
                 if once:
-                    print()
+                    print(render(sample, hist, zones))
                     sys.exit(0)
+                screen.show(dashlib.safe(render, sample, hist, zones))
+                if not dashlib.visible():
+                    hidden = True
+                    break
+            samples.close()                           # stops macmon now, not when the generator is collected
         except FileNotFoundError:
-            sys.stdout.write("\033[H macmon not found - brew install macmon\033[J")
-            sys.stdout.flush()
-        time.sleep(5)  # macmon exited or is missing: keep the pane alive and retry
+            screen.show("\033[H macmon not found - brew install macmon\033[J")
+            if once:
+                print()
+                sys.exit(1)
+        dashlib.wait(0 if hidden else 5)  # nobody looking: macmon stays off until someone is; else it exited or is missing
 except KeyboardInterrupt:
     pass
 finally:

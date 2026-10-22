@@ -1,52 +1,80 @@
 #!/usr/bin/env python3
 """Keyboard-only browser of every Claude Code session, for the tmux `sessions` window.
 
-Type to filter (every word must match title, folder, id, prompts or date). Enter resumes the
-highlighted session in a new tmux window in its own folder; if it is already running, Enter
-jumps to that window instead (only inside its own tmux session: a dashboard never switches your terminal to another
-tmux session), so a conversation is never resumed twice.
+Type to filter: every word must match the title, folder, id, prompts, handoff note or date. Tokens narrow it further,
+and tokens and words all combine with AND:
+  is:open is:warm is:cold is:running is:idle is:orphan     block:Exp   block name prefix (also the block before Open)
+  >400k <100k   context tokens over / under (k, m or none)  $>5 $<1     spent at API prices over / under, in dollars
+Enter resumes the highlighted session in a new tmux window in its own folder; if it is already running, Enter jumps to
+that window instead (only inside its own tmux session: a dashboard never switches your terminal to another tmux
+session), so a conversation is never resumed twice: Enter, n and r read the running state and continued.json again just
+before they act, not from the last refresh (up to 10 s old).
 
 Looks like the dashboard: the window carries the same MAGI tint (dash-theme style) and the same coloured dots.
-Built to survive stray input, like the dash window: the mouse does nothing, Ctrl-C/Z/D are
-swallowed, there is no quit key (the pane-died hook respawns it if it ever dies), and the only
-action is Enter on a highlighted row.
+Built to survive stray input, like the dash window: the mouse does nothing, Ctrl-C/Z/D are swallowed and there is no
+quit key (the pane-died hook respawns it if it ever dies).
 
   type        filter            Esc / Ctrl-U   clear filter        Tab    all / idle / running
-  Up Down     move              PgUp PgDn      page               Ctrl-O show stubs + empty ones
-  Enter       resume or jump    Ctrl-Y         copy resume cmd    Ctrl-R refresh now
+  Up Down     move (Ctrl-P/N)   PgUp PgDn      page                Ctrl-O show stubs + empty ones
+  Enter       resume or jump    Ctrl-Y         copy resume cmd     Ctrl-R refresh now
+  Ctrl-S      sort within blocks: recent (default) / spent / context size / wake cost - remembered in picker.state
+  Ctrl-V      read the thread's handoff note in a tmux popup (its digest when there is only a parked stub or no note)
+  ?           every key and filter token (when the filter is empty; Ctrl-/ or F1 any time) - any key closes it
   Ctrl-K      end the running session completely (asks first: y, or Y when it is busy; the transcript is kept)
   Ctrl-X      mark the thread's handoff note done (or open again)
-  Ctrl-T      park it: a stub note (open, next = your last prompt) and a transcript digest, made here - no API call
-Threads: /handoff (~/.claude/skills/handoff) writes ~/.claude/handoffs/<sessionId>.md; while its status is open the
-session sits in the Open block at the top, whatever its folder. Enter on an idle session that has a note, or is big
-(CTX_WARN_K) and cold, asks first: n = a new session in the same folder that starts from the note - or, without one,
-from a digest of the transcript made here for free (no API call) - started with --session-id so the old one folds under
-it, and with --model set to the old session's model; r = resume as is.
+  Ctrl-T      park it: a stub note (open, next = your last prompt) and a transcript digest, made here; then PARK_MODEL
+              (default haiku, under $.01; off = keep the stub) rewrites the stub from the digest in the background
   Left Right  jump to the previous / next block   Enter on a header  fold / unfold it   Ctrl-G  by block / flat list
+Threads: /handoff (~/.claude/skills/handoff) writes ~/.claude/handoffs/<sessionId>.md; while its status is open the
+session sits in the Open block at the top, whatever its folder - oldest note first (in the recent sort), each row with
+its note's age, yellow when the note was not updated for STALE_DAYS (7) days. Enter on an idle session that has a note,
+or is big (CTX_WARN_K) and cold, asks first: n = a new session in the same folder that starts from the note - or,
+without one, from a digest of the transcript made here for free (no API call) - started with --session-id so the old
+one folds under it, and with --model set to the old session's model; r = resume as is. An open note whose transcript
+Claude Code purged (cleanupPeriodDays) stays in Open as "transcript gone": Enter then n is all it offers.
 Blocks are made automatically from the experiment code of the session's folder (Exp011530 -> Exp, Gen022830 -> Gen,
 Cyt..., Seq...), or of a code named in its title; sessions started in the home folder go to ~, the rest to Other.
 Order: SESSION_BLOCK_ORDER in ~/.config/tmux-dashboard/config (default Gen,Cyt,Seq,Exp), new codes after those.
-The context column is what every step of the session re-sends: '312K 6¢' = 312 thousand tokens, 6 cents per step while the
-cache is warm; '312K ↻$2.5' = the cache went cold and the first step after resuming rewrites it all for $2.50. Yellow from
-CTX_WARN_K (200) thousand tokens - /compact soon; red from CTX_CLEAR_K (400) - /clear or /compact now.
+Columns ctx / step / warm / spent: '312K $.06' = every step of the session re-sends 312 thousand tokens, 6 cents per
+step while the cache is warm, for `warm` (59m, 1h00) more; '312K ↻$2.5' = the cache went cold and the first step after
+resuming rewrites it all for $2.50; spent = the session so far, at API prices. Money is right-aligned, at most 5 cells.
+Colours, as in the sessions panel: the price of a warm cache in the theme's second colour, bold (cold is plain text);
+the context yellow from CTX_WARN_K (200) thousand tokens - /compact soon - and bright red from CTX_CLEAR_K (400) -
+/clear or /compact now; the running dot green when idle, white when busy; secondary text grey.
 
-CLAUDE_BIN (default `claude`) is what is typed into the new window - tests set it to `echo`.
+CLAUDE_BIN (default `claude`) is what is typed into the new window - tests set it to `echo`; CLAUDE_PICKER_STATE moves
+picker.state (tests). The list is rebuilt every REFRESH_S seconds while a tmux client (or the web mirror) shows this
+window, and at once when it comes back on screen; keys act instantly either way.
 """
-import curses, json, os, shlex, signal, subprocess, sys, textwrap, time, traceback, unicodedata, uuid
+import curses, json, os, re, shlex, signal, subprocess, sys, time, traceback, unicodedata, uuid
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import claude_sessions as cs
+import dashlib
 
 os.environ.setdefault("ESCDELAY", "25")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 REFRESH_S = 10
+VISIBLE_EVERY = 2                            # s between dashlib.visible() checks (it shares one tmux call across panels)
+STALE_DAYS = 7                               # an open note not updated for this long is flagged yellow
+LINK_GRACE = 120                             # s: a continuation started here counts as existing before it has a transcript
+RESUME_GRACE = 30                            # s: a session resumed here counts as running before it registers
 MODES = ("all", "idle", "running")
+SORTS = ("recent", "spent", "context", "wake")
 ERRLOG = Path.home() / ".claude" / "dash" / "picker.err"
 DEFAULT_COLLAPSED = {"Auto"}                 # blocks that start folded until you open them once
 BLOCK_NOTES = {"Auto": "runs started by scripts, benchmarks or the SDK (claude -p) - not by you in a terminal",
-               "Open": "threads with an open /handoff note - Enter continues one in a fresh session, Ctrl-X marks it done"}
-STATE = Path.home() / ".claude" / "dash" / "picker.state"     # grouped or flat, which blocks are collapsed
+               "Open": "threads with an open /handoff note, oldest note first - Enter continues one, Ctrl-X marks it done"}
+STATE = Path(os.environ.get("CLAUDE_PICKER_STATE") or Path.home() / ".claude" / "dash" / "picker.state")  # grouped, collapsed, sort
+CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")    # never drawn: curses would expand a tab or act on an escape
+
+# Filter tokens (see the docstring). A token still being typed ("is:ru", "$>") filters nothing yet.
+IS = {"open": lambda r: r["block"] == "Open", "warm": lambda r: bool(r["ctx"] and r["ctx"]["warm"]),
+      "cold": lambda r: bool(r["ctx"] and not r["ctx"]["warm"]), "running": lambda r: bool(r["live"]),
+      "idle": lambda r: not r["live"], "orphan": lambda r: bool(r.get("orphan"))}
+TOKENS_RE = re.compile(r"([<>])(\d*\.?\d+)([km]?)")
+SPENT_RE = re.compile(r"\$([<>])(\d*\.?\d+)")
 
 
 def tmux(*args):
@@ -57,6 +85,7 @@ def tmux(*args):
 
 
 def my_session():
+    """This pane's tmux session, asked each time: `tmux rename-session` must not leave the browser on a stale name."""
     try:
         return tmux("display-message", "-p", "-t", os.environ.get("TMUX_PANE", ""), "#{session_name}")
     except RuntimeError:
@@ -67,8 +96,15 @@ def resume_cmd(r):
     return f"{CLAUDE_BIN} --resume {r['id']}"
 
 
+def tilde(p):
+    p, home = str(p or ""), str(Path.home())
+    return "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+
+
 def open_row(r, sess):
-    """Resume in a new window, or jump to the running one. Returns the status line."""
+    """Resume in a new window, or jump to the running one. `r` carries live state read just now. Returns the status line."""
+    if r.get("orphan"):
+        return "transcript gone - nothing to resume; Enter then n starts a new session from the note"
     lv = r["live"]
     if lv:
         if lv["window_id"]:
@@ -84,35 +120,28 @@ def open_row(r, sess):
 
 def launch(cwd, cmd, sess):
     """Type `cmd` into a new window of this tmux session, opened in `cwd`. Returns (window number, note)."""
+    if not sess:
+        raise RuntimeError("cannot tell which tmux session this browser is in")
     note = ""
     if not cwd or not os.path.isdir(cwd):
         cwd, note = str(Path.home()), " (original folder is gone - opened in ~, resume may not find it)"
     top = max(int(i) for i in tmux("list-windows", "-t", f"={sess}", "-F", "#{window_index}").split())
-    wid = tmux("new-window", "-P", "-F", "#{window_id}", "-t", f"={sess}:{top + 1}", "-c", cwd)
+    wid = tmux("new-window", "-P", "-F", "#{window_id}", "-t", f"={sess}:{top + 1}", "-c", cwd.replace("#", "##"))   # -c is a format
     tmux("send-keys", "-t", wid, "-l", cmd)
     tmux("send-keys", "-t", wid, "Enter")
     return top + 1, note
 
 
 def continue_cmd(r, new):
-    """The command that starts session `new` on `r`'s thread: from its handoff note, else from a digest of its transcript."""
-    h = r["handoff"]
-    if h and not h["parked"]:
-        prompt = (f"Continue the thread in the handoff note {h['path']} (from an earlier session in this folder). Read it and "
-                  f"the files it names as needed, then tell me in 3 lines where we left off and what you will do first.")
-    else:                                        # no note, or only a parked stub: the digest carries the substance
-        parked = f" (parked with the stub note {h['path']})" if h else ""
-        prompt = (f"{cs.write_digest(r)} is a digest of an earlier session in this folder{parked}, made from its transcript "
-                  f"without waking it. Read it, write this thread's handoff note with the handoff skill so the session "
-                  f"browser tracks it, then tell me in 3 lines where we left off and what is next.")
+    """The command that starts session `new` on `r`'s thread (the prompt: cs.continue_prompt - its note, else a digest)."""
     model = (r["ctx"] or {}).get("model")          # the old session's model, so a Sonnet thread does not move to the default
     flag = f"--model {shlex.quote(model)} " if model else ""
-    return f"{CLAUDE_BIN} --session-id {new} {flag}-n {shlex.quote(fit(r['title'], 48) + ' (cont.)')} {shlex.quote(prompt)}"
+    return (f"{CLAUDE_BIN} --session-id {new} {flag}-n {shlex.quote(fit(r['title'], 48) + ' (cont.)')} "
+            f"{shlex.quote(cs.continue_prompt(r))}")
 
 
-def continue_row(r, sess):
-    """A fresh session on `r`'s thread, in a new window; the old session is linked to it and folds away. Returns the status line."""
-    new = str(uuid.uuid4())
+def continue_row(r, sess, new):
+    """Session `new` on `r`'s thread, in a new window; the old session is linked to it and folds away. Returns the status line."""
     n, note = launch(r["cwd"], continue_cmd(r, new), sess)
     cs.add_link(r["id"], new)
     return f"continuing {r['short']} as {new[:8]} in window {n}{note} - the old session folds under it (Ctrl-O shows it)"
@@ -158,16 +187,33 @@ def cells(s):
 
 
 def fit(s, n):
-    """Truncate to n display cells (not characters), with an ellipsis."""
-    s = s.replace("\n", " ")
+    """Truncate to n display cells (not characters), with an ellipsis. Control characters become spaces."""
+    s = CTRL.sub(" ", s or "")
+    if n <= 0:
+        return ""
     if cells(s) <= n:
         return s
-    out, used = "", 0
+    out, used = [], 0
     for ch in s:
         if used + _w(ch) > n - 1:
             break
-        out, used = out + ch, used + _w(ch)
-    return out + "…"
+        out.append(ch)
+        used += _w(ch)
+    return "".join(out) + "…"
+
+
+def fit_tail(s, n):
+    """Like fit(), but keeps the end: a long path shows its last folders."""
+    s = CTRL.sub(" ", s or "")
+    if cells(s) <= n:
+        return s
+    out, used = [], 0
+    for ch in reversed(s):
+        if used + _w(ch) > n - 1:
+            break
+        out.append(ch)
+        used += _w(ch)
+    return "…" + "".join(reversed(out))
 
 
 def pad(s, n):
@@ -175,61 +221,218 @@ def pad(s, n):
     return s + " " * max(0, n - cells(s))
 
 
+def nearest256(hexcode):
+    """The xterm-256 colour nearest to '#rrggbb': the 6x6x6 cube or the grey ramp."""
+    rgb = [int(hexcode.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    levels = (0, 95, 135, 175, 215, 255)
+    q = [min(range(6), key=lambda i: abs(levels[i] - v)) for v in rgb]
+    g = max(0, min(23, round((sum(rgb) / 3 - 8) / 10)))
+    dist = lambda c: sum((a - b) ** 2 for a, b in zip(c, rgb))
+    return 16 + 36 * q[0] + 6 * q[1] + q[2] if dist([levels[i] for i in q]) <= dist([8 + 10 * g] * 3) else 232 + g
+
+
+def layout(W):
+    """x of each column for a window W cells wide. Below 110 columns the created date and id go (the rule line above the
+    preview names both), below 76 the folder; the title takes the rest."""
+    x, cols = 1, {}
+    wide = (("date", 5), ("id", 8)) if W >= 110 else ()
+    for name, w in (("lab", 6), ("dot", 1), ("ago", 4)) + wide + (("size", 5), ("price", 6), ("left", 4), ("spent", 5)):
+        cols[name] = x
+        x += w + 1
+    fw = 20 if W >= 160 else 16 if W >= 120 else 12 if W >= 76 else 0
+    cols.update(title=x, fw=fw, tw=max(10, W - 1 - x - (fw + 1 if fw else 0)))
+    return cols
+
+
+def parse_filter(text):
+    """(tests, words): the filter's tokens as predicates on a row, and the plain words left for cs.matches()."""
+    tests, words = [], []
+    for w in text.lower().split():
+        if w.startswith("is:"):
+            v = w[3:]
+            if v in IS:
+                tests.append(IS[v])
+                continue
+            if any(k.startswith(v) for k in IS):          # still typing it
+                continue
+        elif w.startswith("block:"):
+            v = w[6:]
+            tests.append(lambda r, v=v: r["block"].lower().startswith(v) or (r.get("home_block") or "").lower().startswith(v))
+            continue
+        elif m := TOKENS_RE.fullmatch(w):
+            lim = float(m.group(2)) * {"": 1, "k": 1e3, "m": 1e6}[m.group(3)]
+            tests.append(lambda r, gt=m.group(1) == ">", lim=lim:
+                         bool(r["ctx"]) and (r["ctx"]["tokens"] > lim if gt else r["ctx"]["tokens"] < lim))
+            continue
+        elif m := SPENT_RE.fullmatch(w):
+            tests.append(lambda r, gt=m.group(1) == ">", lim=float(m.group(2)):
+                         (r.get("spent") or 0) > lim if gt else (r.get("spent") or 0) < lim)
+            continue
+        elif re.fullmatch(r"\$?[<>]?\.?", w):            # a token half typed: $  $>  >  >.  $<.
+            continue
+        words.append(w)
+    return tests, words
+
+
+def sort_key(name):
+    return {"spent": lambda r: r.get("spent") or 0, "context": lambda r: (r["ctx"] or {}).get("tokens") or 0,
+            "wake": lambda r: (r["ctx"] or {}).get("wake") or 0}[name]
+
+
+HELP = [  # (text, style); every line fits 79 cells
+    ("Session browser - every key                              any key closes this", "bold"),
+    ("Enter      resume in a new window, or jump to its window when it runs here;", ""),
+    ("           with a note, or big and cold: n = new session from the note (or a", ""),
+    ("           free digest), r = resume as is; transcript gone: n only", ""),
+    ("Up Down    move (Ctrl-P Ctrl-N)   PgUp PgDn  page    Home End  first / last", ""),
+    ("Left Right previous / next block  Enter on a block header  fold / unfold", ""),
+    ("type       filter    Backspace  delete    Esc Ctrl-U  clear the filter", ""),
+    ("Tab        all / idle / running   Ctrl-G  blocks / flat   Ctrl-O  stubs+empty", ""),
+    ("Ctrl-S     sort within blocks: recent / spent / context / wake cost", ""),
+    ("Ctrl-V     read the note (digest for a stub / no note) in a popup; q closes", ""),
+    ("Ctrl-T     park: stub note + digest made here, the session is not woken", ""),
+    ("Ctrl-X     mark the note done / open again", ""),
+    ("Ctrl-K     end a running session (asks: y, or Y when busy; transcript kept)", ""),
+    ("Ctrl-Y     copy the resume command    Ctrl-R  refresh now", ""),
+    ("?          this help, when the filter is empty (Ctrl-/ or F1 at any time)", ""),
+    ("Filter tokens - all combine with the words (AND)", "bold"),
+    ("is:open is:warm is:cold is:running is:idle is:orphan", ""),
+    (">400k <100k  context tokens over / under    block:Exp  block name prefix", ""),
+    ("$>5 $<1      spent at API prices over / under, in dollars", ""),
+    ("Colours", "bold"),
+    ("legend 1", "legend"),
+    ("legend 2", "legend"),
+]
+
+
 class Picker:
     def __init__(self, scr):
-        self.scr, self.sess = scr, my_session()
+        self.scr = scr
+        self.sess = my_session()                 # for labels only; every action asks tmux again (rename-session)
         self.rows, self.items, self.all_rows = [], [], []
-        self.filter, self.mode, self.show_hidden = "", 0, False
+        self.filter, self.mode, self.show_hidden, self.sort = "", 0, False, 0
         self.grouped, self.collapsed, self.expanded = True, set(), set()
         self.load_state()
         self.sel_key, self.sel, self.top, self.force_first = None, 0, 0, False
         self.msg, self.msg_until, self.last_refresh = "", 0, 0
         self.confirm = None                      # a question on the last line: {"keys": {key: action}, "prompt", "until"}
+        self.help = False                        # the key help overlay
+        self.launched = {}                       # session id -> when n started it here (it has no transcript yet)
+        self.seen, self.seen_at = True, 0        # dashlib.visible(), and when it was last asked
+        self.second = None
         curses.curs_set(0)
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_RED, -1)
-        curses.init_pair(4, 208 if curses.COLORS >= 256 else curses.COLOR_YELLOW, -1)   # prompt cache warm: orange
-        curses.init_pair(5, 75 if curses.COLORS >= 256 else curses.COLOR_BLUE, -1)     # prompt cache cold: sky blue
+        self.colours()
         scr.keypad(True)
         scr.timeout(1000)
         self.refresh()
 
-    # ---- state that survives a restart: which blocks are collapsed, grouped or flat ----
-    def load_state(self):
+    def colours(self):
+        """Colour pairs, the same meanings as the sessions panel. Re-read on refresh: dash-theme can switch the theme."""
+        second = dashlib.theme_hex("second")
+        if second == self.second and self.second is not None:
+            return
+        self.second = second
+        many = curses.COLORS >= 256
         try:
+            warm = nearest256(second) if many and second else curses.COLOR_CYAN
+        except (ValueError, TypeError):
+            warm = curses.COLOR_CYAN
+        curses.init_pair(1, curses.COLOR_GREEN, -1)                       # idle dot
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)                      # a threshold: context, a stale note, minutes running out
+        curses.init_pair(3, 196 if many else curses.COLOR_RED, -1)        # context past CTX_CLEAR_K: bright red
+        curses.init_pair(4, warm, -1)                                     # cache warm: the theme's second colour (#3cffd0 -> 86)
+        curses.init_pair(5, 245 if many else curses.COLOR_WHITE, -1)      # secondary text: grey (A_DIM is ~2.3:1 on MAGI orange)
+        curses.init_pair(6, 231 if many else curses.COLOR_WHITE, -1)      # busy dot: white
+        P, B = curses.color_pair, curses.A_BOLD
+        self.A = {None: 0, "idle": P(1), "warn": P(2) | B, "clear": P(3) | B, "warm": P(4) | B, "warmtext": P(4),
+                  "grey": P(5), "busy": P(6) | B, "bold": B}
+
+    # ---- state that survives a restart: grouped or flat, which blocks are collapsed, the sort ----
+    def state(self):
+        return {"grouped": self.grouped, "collapsed": sorted(self.collapsed), "expanded": sorted(self.expanded),
+                "sort": SORTS[self.sort]}
+
+    def load_state(self):
+        self.saved = self.state()                # as last read or written (the defaults without a file): save_state()
+        try:                                     # writes only what changed here since
             d = json.loads(STATE.read_text())
             self.grouped, self.collapsed, self.expanded = bool(d.get("grouped", True)), set(d.get("collapsed", [])), set(d.get("expanded", []))
-        except (OSError, ValueError):
-            pass
+            self.sort = SORTS.index(d["sort"]) if d.get("sort") in SORTS else 0
+        except (OSError, ValueError, AttributeError, TypeError):
+            return
+        self.saved = self.state()
 
     def save_state(self):
+        """Write back only what changed in this picker since it last loaded or saved; the rest comes from the file, which
+        the other dashboard's picker writes too - so a fold there does not undo a sort change here."""
+        mine = self.state()
+        try:
+            disk = json.loads(STATE.read_text())
+            disk = disk if isinstance(disk, dict) else {}
+        except (OSError, ValueError):
+            disk = {}
+        out = {}
+        for k, v in mine.items():
+            was = self.saved.get(k, v)
+            if k in ("collapsed", "expanded"):           # per block: what was folded / unfolded here, on top of the file
+                d = set(disk[k]) if isinstance(disk.get(k), list) else set(was)
+                out[k] = sorted((d - (set(was) - set(v))) | (set(v) - set(was)))
+            else:
+                out[k] = v if v != was or k not in disk else disk[k]
         try:
             STATE.parent.mkdir(parents=True, exist_ok=True)
-            STATE.write_text(json.dumps({"grouped": self.grouped, "collapsed": sorted(self.collapsed), "expanded": sorted(self.expanded)}))
+            tmp = STATE.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(out))
+            os.replace(tmp, STATE)
         except OSError:
-            pass
+            return
+        self.saved = out
+        self.grouped, self.collapsed, self.expanded = bool(out["grouped"]), set(out["collapsed"]), set(out["expanded"])
+        self.sort = SORTS.index(out["sort"]) if out["sort"] in SORTS else self.sort
 
     # ---- data ----
     def refresh(self):
         self.all_rows = cs.build()
         self.last_refresh = time.time()
+        self.sess = my_session() or self.sess
+        self.colours()
         self.apply_filter()
+
+    def fresh(self, r):
+        """`r` with its running state and continuation read now, not at the last refresh: a session resumed elsewhere, or
+        continued by an earlier n, in the meantime is not opened a second time. r["cont"] = the session it was continued
+        as, when that one exists: running, with a transcript, or started here in the last LINK_GRACE s (a link to a
+        session that never started does not block a new one)."""
+        live = cs.live_map()
+        new = cs.links().get(r["id"]) or r.get("continued_by")
+        if new and not (new in live or time.time() - self.launched.get(new, 0) < LINK_GRACE
+                        or any(cs.PROJECTS.glob(f"*/{new}.jsonl"))):
+            new = None
+        return dict(r, live=None if r.get("orphan") else live.get(r["id"]), cont=new, cont_live=live.get(new) if new else None)
+
+    def sorted_rows(self, rows, block=None):
+        s = SORTS[self.sort]
+        if s == "recent":                        # build() order is newest use first; Open: oldest note first, stale threads surface
+            if block == "Open":
+                return sorted(rows, key=lambda r: (r["handoff"] or {}).get("updated") or r["last"])
+            return rows
+        return sorted(rows, key=sort_key(s), reverse=True)
 
     def build_items(self):
         """What the list shows: session rows, under one header per block when grouped."""
         if not self.grouped:
-            return [{"t": "row", "r": r} for r in self.rows]
+            return [{"t": "row", "r": r} for r in self.sorted_rows(self.rows)]
         by = {}
         for r in self.rows:
             by.setdefault(r["block"], []).append(r)
         items = []
         for b in cs.block_order(self.rows):
             collapsed = self.is_collapsed(b) and not self.filter      # a search always opens the blocks
-            items.append({"t": "hdr", "b": b, "rows": by[b], "collapsed": collapsed})
+            rows = self.sorted_rows(by[b], b)
+            items.append({"t": "hdr", "b": b, "rows": rows, "collapsed": collapsed})
             if not collapsed:
-                items += [{"t": "row", "r": r} for r in by[b]]
+                items += [{"t": "row", "r": r} for r in rows]
         return items
 
     @staticmethod
@@ -237,7 +440,7 @@ class Picker:
         return ("hdr", it["b"]) if it["t"] == "hdr" else ("row", it["r"]["id"])
 
     def apply_filter(self):
-        words = self.filter.lower().split()
+        tests, words = parse_filter(self.filter)
         rows = self.all_rows
         if not self.show_hidden:
             rows = [r for r in rows if not (r["folded"] or r["empty"])]
@@ -245,7 +448,7 @@ class Picker:
             rows = [r for r in rows if not r["live"]]
         elif MODES[self.mode] == "running":
             rows = [r for r in rows if r["live"]]
-        self.rows = [r for r in rows if cs.matches(r, words)]
+        self.rows = [r for r in rows if cs.matches(r, words) and all(t(r) for t in tests)]
         self.items = self.build_items()
         keys = [self.key_of(it) for it in self.items]
         if self.force_first:                     # the filter just changed: the first match is what Enter should act on
@@ -269,136 +472,315 @@ class Picker:
     def say(self, text, secs=5):
         self.msg, self.msg_until = text, time.time() + secs
 
+    @staticmethod
+    def asks(r):
+        """Enter asks n / r first: there is a note to start from, or waking it would be dear."""
+        c = r["ctx"]
+        return bool(r.get("orphan") or r["handoff"] or (c and not c["warm"] and c["level"]))
+
     # ---- drawing ----
+    def put(self, y, x, s, attr=0, width=None):
+        """Draw `s` at (y, x), cut by display cells to `width` and to the last column but one - a wide (CJK, emoji)
+        character never pushes text past the edge, and nothing lands in the bottom-right cell, where curses raises ERR.
+        Returns the x after it."""
+        H, W = self.scr.getmaxyx()
+        room = W - 1 - x
+        if not 0 <= y < H or room <= 0:
+            return x
+        s = fit(s, room if width is None else min(width, room))
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:                     # a character the terminal sizes differently: lose a cell, not the browser
+            pass
+        return x + cells(s)
+
+    def puts(self, y, x, segs, width=None):
+        """Draw [(text, attr), ...] one after another from x, within `width` cells."""
+        end = (self.scr.getmaxyx()[1] - 1) if width is None else x + width
+        for text, attr in segs:
+            if x >= end:
+                break
+            x = self.put(y, x, text, attr, end - x)
+        return x
+
     def draw(self):
         scr = self.scr
         scr.erase()
         H, W = scr.getmaxyx()
         if H < 12 or W < 60:
-            scr.addnstr(0, 0, "window too small for the session browser", W - 1)
+            self.put(0, 0, "window too small for the session browser")
             scr.refresh()
             return
-        list_h = H - 2 - 7                       # title + header on top, 6 preview lines + hint at the bottom
+        if self.help:
+            self.draw_help(H, W)
+            scr.refresh()
+            return
+        L = layout(W)
+        list_h = H - 2 - 8                       # title + filter on top; rule, 6 preview lines and the hint at the bottom
         self.sel = max(0, min(self.sel, len(self.items) - 1))
         if self.sel < self.top:
             self.top = self.sel
         if self.sel >= self.top + list_h:
             self.top = self.sel - list_h + 1
-        n_hidden = sum(1 for r in self.all_rows if r["folded"] or r["empty"])
-        head = f" Claude sessions  {len(self.rows)} shown  [{MODES[self.mode]}]  {'by block' if self.grouped else 'flat'}"
-        if self.show_hidden:
-            head += "  +stubs"
-        elif n_hidden:
-            head += f"  ({n_hidden} stubs/empty hidden: Ctrl-O)"
-        n_big = sum(1 for r in self.all_rows if r["live"] and r["ctx"] and r["ctx"]["level"] == 2)
-        scr.addnstr(0, 0, head, W - 1, curses.A_BOLD)
-        if n_big and cells(head) + 30 < W:
-            scr.addnstr(0, cells(head) + 2, f"{n_big} running over {cs.CTX_CLEAR // 1000}K: /clear or /compact", W - cells(head) - 3, curses.color_pair(3) | curses.A_BOLD)
-        flt = f" filter: {self.filter}▏" if self.filter else " filter: (type to search)"
-        scr.addnstr(1, 0, flt, W - 1, curses.A_DIM if not self.filter else curses.A_NORMAL)
-
-        fw = 16 if W >= 100 else 0               # narrow window: drop the folder column, keep the title readable
-        tw = max(10, W - (53 + (fw + 1 if fw else 0) + 1))   # 53 = the fixed columns in front of the title
-        if cells(flt) < 29:                                   # column titles for the context cells, on the filter line
-            scr.addnstr(1, 30, f"{'ctx':>5} {'step':<5} {'warm':>4} {'spent':>5}", 22, curses.A_DIM)
+        self.top = max(0, min(self.top, len(self.items) - list_h))
         now = time.time()
+        self.draw_head(W)
+        self.draw_filter_line(L, W)
         for i in range(list_h):
             k = self.top + i
             if k >= len(self.items):
                 break
-            it, y = self.items[k], 2 + i
-            if it["t"] == "hdr":                 # block header: ▾ Gen · 3 sessions · 1 running ────────
-                n = len(it["rows"])
-                live = sum(1 for r in it["rows"] if r["live"])
-                text = f" {'▸' if it['collapsed'] else '▾'} {it['b']}  ·  {n} session{'' if n == 1 else 's'}" + (f"  ·  {live} running" if live else "") + " "
-                line = text + "─" * max(0, W - 1 - len(text))
-                scr.addnstr(y, 0, line.ljust(W - 1) if k == self.sel else line, W - 1, curses.A_REVERSE | curses.A_BOLD if k == self.sel else curses.A_BOLD)
-                continue
-            r = it["r"]
-            lab = cs.live_label(r, self.sess)
-            dot = "●" if r["live"] else " "                  # same dots as the dashboard's sessions panel
-            size, price, left, spent = cs.ctx_cells(r)
-            line = (f" {lab:>6} {dot} {cs.ago(now - r['last']):>4} {time.strftime('%m-%d', time.localtime(r['created'])):<5} {r['short']:<8} "
-                    f"{size:>5} {price:<5} {left:>4} {spent:>5} {pad(fit(r['title'], tw), tw)}{' ' + fit(r['folder'], fw) if fw else ''}")
-            if k == self.sel:
-                scr.addnstr(y, 0, line.ljust(W - 1), W - 1, curses.A_REVERSE)
+            it = self.items[k]
+            if it["t"] == "hdr":
+                self.draw_header(2 + i, it, W, k == self.sel, now)
             else:
-                scr.addnstr(y, 0, line, W - 1, curses.A_NORMAL)
-                if r["live"]:                                     # yellow busy, green idle, as in the panel
-                    scr.addnstr(y, 8, "●", 1, curses.color_pair(2 if r["live"]["status"] == "busy" else 1))
-                c = r["ctx"]
-                if c and c["level"]:                              # yellow past CTX_WARN_K, red past CTX_CLEAR_K
-                    scr.addnstr(y, 30, f"{size:>5}", 5, curses.color_pair(3 if c["level"] == 2 else 2) | curses.A_BOLD)
-                if c:                                             # the price: orange while the cache is warm, blue once cold
-                    scr.addnstr(y, 36, f"{price:<5}", 5, curses.color_pair(4 if c["warm"] else 5))
-                if c and c["warm"]:                               # minutes left: yellow under 10 for an idle session, else dim
-                    hurry = c["left"] < 600 and not (r["live"] and r["live"]["status"] == "busy")
-                    scr.addnstr(y, 42, f"{left:>4}", 4, curses.color_pair(2) if hurry else curses.A_DIM)
+                self.draw_row(2 + i, it["r"], L, W, now, k == self.sel)
         if not self.items:
-            scr.addnstr(3, 2, "no session matches", W - 3, curses.A_DIM)
+            self.put(3, 2, "no session matches", self.A["grey"])
+        self.draw_preview(H - 8, W, now)
+        self.draw_bottom(H, W)
+        scr.refresh()
 
-        # preview of the highlighted row or block
-        y0 = H - 7
-        it = self.cur()
-        lines = []
-        if it and it["t"] == "hdr":
-            rs = it["rows"]
+    def draw_head(self, W):
+        n_hidden = sum(1 for r in self.all_rows if r["folded"] or r["empty"])
+        n_big = sum(1 for r in self.all_rows if r["live"] and r["ctx"] and r["ctx"]["level"] == 2)
+        head = f" Claude sessions  {len(self.rows)} shown  [{MODES[self.mode]}]  {'by block' if self.grouped else 'flat'}"
+        k = cs.CTX_CLEAR // 1000
+        w0, w1 = (f"{n_big} running over {k}K: /clear or /compact", f"{n_big} running >{k}K") if n_big else (None, None)
+        h0, h1 = (("+stubs", "+stubs") if self.show_hidden else
+                  (f"({n_hidden} stubs/empty hidden: Ctrl-O)", f"(+{n_hidden} hidden)") if n_hidden else (None, None))
+        # the warning outranks the stubs hint: the hint shrinks and goes before the warning does
+        for w, h in ((w0, h0), (w0, h1), (w0, None), (w1, h1), (w1, None), (None, h1), (None, None)):
+            if cells(head) + sum(cells(t) + 2 for t in (w, h) if t) <= W - 1:
+                break
+        x = self.put(0, 0, head, curses.A_BOLD)
+        if w:
+            x = self.put(0, x + 2, w, self.A["clear"])
+        if h:
+            self.put(0, x + 2, h, self.A["grey"])
+
+    def draw_filter_line(self, L, W):
+        """Line 1: the sort on the left, the column titles over their columns, the filter over the titles."""
+        sort = SORTS[self.sort]
+        label = (f" sort: {sort}" + ("  (Ctrl-S)" if L["size"] > 24 else "")) if "id" in L else f" sort:{sort}"
+        self.put(1, 0, label, self.A["grey"] if sort == "recent" else curses.A_BOLD, L["size"] - 1)
+        g = self.A["grey"]
+        self.put(1, L["size"], f"{'ctx':>5}", g)
+        self.put(1, L["price"], f"{'step':>6}", g)
+        self.put(1, L["left"], f"{'warm':>4}", g)
+        self.put(1, L["spent"], f"{'spent':>5}", g)
+        room = W - 1 - L["title"]
+        if self.filter:
+            shown = f"filter: {self.filter}▏"
+            if cells(shown) > room:              # a long filter shows its end, where you type
+                text = self.filter
+                while text and cells(f"filter: …{text}▏") > room:
+                    text = text[1:]
+                shown = f"filter: …{text}▏"
+            self.put(1, L["title"], shown, curses.A_BOLD)
+        else:
+            self.put(1, L["title"], "filter: type to search   is:warm >400k block:Exp $>5 ...   ? keys", g)
+
+    def draw_header(self, y, it, W, selected, now):
+        """Block header: ▾ Gen  ·  3 sessions  ·  1 running ──────"""
+        rs = it["rows"]
+        n, live = len(rs), sum(1 for r in rs if r["live"])
+        text = f" {'▸' if it['collapsed'] else '▾'} {it['b']}  ·  {n} session{'' if n == 1 else 's'}" + (f"  ·  {live} running" if live else "")
+        if it["b"] == "Open":
+            stale = sum(1 for r in rs if r["handoff"] and now - r["handoff"]["updated"] > STALE_DAYS * 86400)
+            gone = sum(1 for r in rs if r.get("orphan"))
+            text += (f"  ·  {stale} not updated in {STALE_DAYS} d" if stale else "") + (f"  ·  {gone} transcript gone" if gone else "")
+        text += " "
+        line = text + "─" * max(0, W - 1 - cells(text))
+        self.put(y, 0, line, curses.A_REVERSE | curses.A_BOLD if selected else curses.A_BOLD)
+
+    def draw_row(self, y, r, L, W, now, selected):
+        c, lv, h = r["ctx"], r["live"], r["handoff"]
+        size, price, left, spent = cs.ctx_cells(r)
+        if selected:
+            self.put(y, 0, " " * (W - 1), curses.A_REVERSE)
+            at = lambda key: curses.A_REVERSE
+        else:
+            at = lambda key: self.A[key]
+        put = self.put
+        put(y, L["lab"], f"{cs.live_label(r, self.sess):>6}", at(None), 6)
+        if lv:                                              # green idle, white busy
+            put(y, L["dot"], "●", at("busy" if lv["status"] == "busy" else "idle"), 1)
+        put(y, L["ago"], f"{cs.ago(now - r['last']):>4}", at(None), 4)
+        if "id" in L:
+            put(y, L["date"], time.strftime("%m-%d", time.localtime(r["created"])), at("grey"), 5)
+            put(y, L["id"], r["short"], at("grey"), 8)
+        if r.get("orphan"):
+            span = L["spent"] + 5 - L["size"]
+            put(y, L["size"], f"{'transcript gone':>{span}}", at("grey"), span)
+        else:
+            put(y, L["size"], f"{size:>5}", at(("clear" if c["level"] == 2 else "warn") if c and c["level"] else None), 5)
+            put(y, L["price"], f"{price:>6}", at("warm" if c and c["warm"] else None), 6)
+            if left:                                        # warm minutes left: yellow under 10 for an idle session
+                hurry = c["left"] < 600 and not (lv and lv["status"] == "busy")
+                put(y, L["left"], f"{left:>4}", at("warn" if hurry else "warmtext"), 4)
+            put(y, L["spent"], f"{spent:>5}", at(None), 5)
+        tw, tag = L["tw"], ""
+        if r["block"] == "Open" and h:                      # the note's age; yellow when it went stale
+            tag = f"{'stub' if h['parked'] else 'note'} {cs.ago(now - h['updated'])}"
+        in_folder = bool(tag and L["fw"] and "id" not in L)   # narrow: the note's age takes the folder's place (the preview names it)
+        title_w = tw - (cells(tag) + 1 if tag and not in_folder else 0)
+        put(y, L["title"], r["title"], at(None), title_w)
+        if tag:
+            stale = now - h["updated"] > STALE_DAYS * 86400
+            put(y, L["title"] + (tw if in_folder else title_w) + 1, tag, at("warn" if stale else "grey"))
+        if L["fw"] and not in_folder:
+            put(y, L["title"] + tw + 1, r["folder"], at("grey"), L["fw"])
+
+    def preview(self, it, now):
+        """(rule label, lines): what the rule above the preview names, and up to 6 lines of (text, attr) segments."""
+        A, B = self.A, curses.A_BOLD
+        g, sep = A["grey"], ("  ·  ", A["grey"])
+        if not it:
+            return "", []
+        if it["t"] == "hdr":
+            rs, b = it["rows"], it["b"]
             live = sum(1 for r in rs if r["live"])
             newest = max(rs, key=lambda r: r["last"])
-            lines = [(f"{it['b']}: {len(rs)} session{'' if len(rs) == 1 else 's'}, {live} running", curses.A_BOLD),
-                     (f"most recent: {newest['title']}  ({cs.ago(now - newest['last'])} ago)", curses.A_NORMAL),
-                     (BLOCK_NOTES.get(it["b"], "Enter collapses / expands this block  ·  Left / Right jump between blocks  ·  Ctrl-G flat list"), curses.A_DIM)]
-        elif it:
-            r = it["r"]
-            lv = r["live"]
-            where = ((f"RUNNING in tmux {lv['tmux_session']}:{lv['window_index']} ({lv['status']}) - Enter jumps there" if lv["tmux_session"] == self.sess
-                      else f"RUNNING in the other tmux session '{lv['tmux_session']}' (window {lv['window_index']}, {lv['status']}) - Enter will not jump across sessions") if lv and lv["window_id"]
-                     else f"RUNNING outside tmux ({cs.live_label(r)}) - cannot be opened here" if lv else "idle - Enter resumes it in a new window")
-            made = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created"]))
-            used = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["last"]))
-            cost = f"  ·  spent {cs.money(r['spent'])} at API prices" if r.get("spent") else ""
-            lines = [
-                (r["title"], curses.A_BOLD),
-                (resume_cmd(r), curses.A_NORMAL),
-                (f"{r['cwd'] or '?'}  ·  created {made}  ·  last used {used}  ·  {r['size'] / 1e6:.1f} MB{cost}", curses.A_DIM),
-                (where, curses.A_NORMAL),
-            ]
-            c = r["ctx"]
-            if c:
-                cache = (f"cache warm {cs.ago(c['left'])}, each step re-reads it for {cs.money(c['step'])}" if c["warm"]
-                         else f"cache cold: the first step after resuming rewrites it for {cs.money(c['wake'])}")
-                advice = ("" if not c["level"] else f"  ·  over {cs.CTX_WARN // 1000}K: /compact soon" if c["level"] == 1
-                          else f"  ·  over {cs.CTX_CLEAR // 1000}K: /clear or /compact now" if c["warm"] or r["live"]
-                          else f"  ·  over {cs.CTX_CLEAR // 1000}K: a fresh session is cheaper than resuming this one")
-                lines.append((f"context {cs.ctx_label(c).split()[0]} tokens ({c['model']})  ·  {cache}{advice}",
-                              curses.color_pair(3 if c["level"] == 2 else 2 if c["level"] else 0)))
-            h = r["handoff"]
-            if h:                                         # the note says more than the last prompt does
-                lines.append((f"handoff note ({h['status']}): next - {h['next'] or '?'}", curses.A_BOLD))
-            elif r.get("continued_by"):
-                lines.append((f"continued in session {r['continued_by'][:8]}", curses.A_DIM))
-            else:
-                prompt = r["last_prompt"] or r["first_prompt"]
-                wrapped = textwrap.wrap("last prompt: " + prompt, W - 3)[:1] if prompt else []
-                lines += [(w, curses.A_DIM) for w in wrapped]
-        for j, (text, attr) in enumerate(lines[:6]):
-            scr.addnstr(y0 + j, 1, fit(text, W - 3), W - 3, attr)
+            lines = [[(f"{b}: {len(rs)} session{'' if len(rs) == 1 else 's'}, {live} running", B)],
+                     [(f"most recent: {newest['title']}  ({cs.ago(now - newest['last'])} ago)", 0)],
+                     [(BLOCK_NOTES.get(b, "Enter collapses / expands this block  ·  Left / Right jump between blocks  ·  Ctrl-G flat list"), g)]]
+            if b == "Open":
+                notes = sorted((r for r in rs if r["handoff"]), key=lambda r: r["handoff"]["updated"])
+                stale = [r for r in notes if now - r["handoff"]["updated"] > STALE_DAYS * 86400]
+                if notes:
+                    lines.append([(f"oldest note: {notes[0]['title']}  ({cs.ago(now - notes[0]['handoff']['updated'])} ago)",
+                                   A["warn"] if stale else 0)])
+                if stale:
+                    lines.append([(f"{len(stale)} not updated in {STALE_DAYS} days - continue them (Enter then n) or close them (Ctrl-X)", A["warn"])])
+            return f"block {b}", lines
+        r = it["r"]
+        c, lv, h, orphan = r["ctx"], r["live"], r["handoff"], r.get("orphan")
+        when = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+        blk = r["block"] + (f" (from {r['home_block']})" if r["block"] == "Open" and r.get("home_block") not in (None, "Open") else "")
+        label = (f"{r['short']} · {blk} · transcript gone · note updated {when(r['last'])}" if orphan else
+                 f"{r['short']} · {blk} · created {when(r['created'])} · last used {when(r['last'])} · {r['size'] / 1e6:.1f} MB")
+        lines = [[(r["title"], B)] + ([sep, ("transcript gone", g)] if orphan else [])]
+        # where: folder, then window
+        if orphan:
+            state = "transcript gone (Claude Code purged it) - Enter then n starts a new session from the note"
+        elif lv and lv["window_id"]:
+            state = (f"running in window {lv['window_index']} ({lv['status']}) - Enter jumps there" if lv["tmux_session"] == self.sess
+                     else f"running in tmux session '{lv['tmux_session']}' (window {lv['window_index']}, {lv['status']}) - Enter will not jump across sessions")
+        elif lv:
+            state = f"running outside tmux ({cs.live_label(r)}) - cannot be opened here"
+        elif self.asks(r):
+            state = "idle - Enter asks: n = new session from the note or a digest, r = resume"
+        else:
+            state = "idle - Enter resumes it in a new window"
+        lines.append([(fit_tail(tilde(r["cwd"]) or "?", max(24, (self.scr.getmaxyx()[1] - 2) // 2)), 0), sep, (state, B if lv else 0)])
+        # cost: context, cache, wake, spent - what decides between resuming and starting fresh
+        if c:
+            lvl = ("clear" if c["level"] == 2 else "warn") if c["level"] else None
+            seg = [(f"context {cs.ctx_label(c).split()[0]} tokens", A[lvl]), (f" ({(c['model'] or '?').removeprefix('claude-')})", g), sep]
+            seg += ([(f"cache warm {dashlib.dur(c['left'])} more, {cs.money(c['step'])} per step", A["warmtext"])] if c["warm"]
+                    else [("cache cold", 0)])
+            seg += [sep, (f"wake {cs.money(c['wake'])} exact" if c.get("wake_exact") else f"wake ~{cs.money(c['wake'])}", 0)]
+            if r.get("spent"):
+                seg += [sep, (f"spent {cs.money(r['spent'])}", 0)]
+            if c["level"]:
+                seg += [sep, (f"over {cs.CTX_WARN // 1000}K: /compact soon" if c["level"] == 1
+                              else f"over {cs.CTX_CLEAR // 1000}K: /clear or /compact now" if c["warm"] or lv
+                              else f"over {cs.CTX_CLEAR // 1000}K: a fresh session is cheaper than resuming this one", A[lvl])]
+            if c.get("misses"):
+                seg += [sep, (f"{c['misses']} cache misses re-sent {cs.money(c.get('missed_usd'))}", g)]
+            lines.append(seg)
+        elif not orphan:
+            lines.append([("no API response yet - context unknown", g)] + ([sep, (f"spent {cs.money(r['spent'])}", 0)] if r.get("spent") else []))
+        # the note: its next step and age
+        digest = (Path(h["path"]).with_name(Path(h["path"]).stem + ".digest.md") if h else cs.HANDOFFS / f"{r['id']}.digest.md")
+        if h:
+            age = now - h["updated"]
+            whose = "" if Path(h["path"]).stem == r["id"] else " of the session it continues"
+            lines.append([(f"note{whose} ({h['status']}{', parked stub' if h['parked'] else ''}, ", 0),
+                          (f"updated {cs.ago(age)} ago", A["warn"] if age > STALE_DAYS * 86400 else 0), ("): next - ", 0),
+                          (h["next"] or "?", B)])
+        elif r.get("continued_by"):
+            lines.append([(f"continued in session {r['continued_by'][:8]}", g)])
+        elif r["last_prompt"] or r["first_prompt"]:
+            lines.append([("last prompt: " + (r["last_prompt"] or r["first_prompt"]), g)])
+        # where the note / digest / transcript is
+        has_digest = digest.exists()
+        if h:
+            lines.append([(f"note {tilde(h['path'])}" + (" (+ .digest.md beside it)" if has_digest else "") + "  ·  Ctrl-V reads it", g)])
+        elif has_digest:
+            lines.append([(f"digest {tilde(digest)}  ·  Ctrl-V reads it", g)])
+        elif r["proj_dir"]:
+            lines.append([(f"transcript {tilde(cs.PROJECTS / r['proj_dir'] / (r['id'] + '.jsonl'))}  ·  no note: Ctrl-T parks it", g)])
+        # the command, last
+        lines.append([("no resume command: the transcript is gone - Enter then n continues from the note", g)] if orphan
+                     else [(resume_cmd(r), 0)])
+        return label, lines
+
+    def draw_preview(self, y0, W, now):
+        label, lines = self.preview(self.cur(), now)
+        self.put(y0, 0, "─" * (W - 1), self.A["grey"])
+        if label:
+            self.put(y0, 2, f" {label} ", curses.A_BOLD)
+        for j, segs in enumerate(lines[:6]):
+            self.puts(y0 + 1 + j, 1, segs, W - 2)
+
+    def hints(self, it, room):
+        """The most useful keys for the highlighted line that fit in `room` cells, by priority, then the help key."""
+        r = it["r"] if it and it["t"] == "row" else None
+        want = (["Enter fold"] if it and it["t"] == "hdr" else ["Enter new from note"] if r and r.get("orphan")
+                else ["Enter jump"] if r and r["live"] else ["Enter resume"] if r else [])
+        if self.filter:
+            want.append("Esc clear")
+        want += ["←→ blocks"] if self.grouped else []
+        if r and r["live"]:
+            want.append("Ctrl-K end")
+        want += ["Ctrl-V note", "Ctrl-X done"] if r and r["handoff"] else ["Ctrl-T park"] if r else []
+        want += ["Tab all/idle/running", "Ctrl-S sort", "Ctrl-G flat" if self.grouped else "Ctrl-G blocks", "Ctrl-O stubs",
+                 "Ctrl-Y copy", "Ctrl-R refresh"]
+        last = "? keys" if not self.filter else "Ctrl-/ keys"
+        out = []
+        for h in want:
+            if cells(" · ".join(out + [h, last])) > room:
+                break
+            out.append(h)
+        return " · ".join(out + [last])
+
+    def draw_bottom(self, H, W):
         if self.confirm and time.time() > self.confirm["until"]:
             self.confirm = None
             self.say("cancelled", 2)
         if self.confirm:
-            c = self.confirm
-            scr.addnstr(H - 1, 0, (" " + fit(c["prompt"], W - 3)).ljust(W - 1), W - 1, curses.A_REVERSE | curses.A_BOLD)
+            self.put(H - 1, 0, pad(" " + fit(self.confirm["prompt"], W - 3), W - 1), curses.A_REVERSE | curses.A_BOLD)
+        elif time.time() < self.msg_until:
+            self.put(H - 1, 1, self.msg, curses.A_BOLD)
         else:
-            status = self.msg if time.time() < self.msg_until else "Enter resume/jump · ←→ blocks · Tab all/idle/running · Ctrl-K end · Ctrl-T park · Ctrl-X done · Ctrl-Y copy · Ctrl-G flat · Ctrl-U clear · Ctrl-O stubs · Ctrl-R refresh"
-            scr.addnstr(H - 1, 1, fit(status, W - 3), W - 3, curses.A_BOLD if time.time() < self.msg_until else curses.A_DIM)
-        scr.refresh()
+            self.put(H - 1, 1, self.hints(self.cur(), W - 3), self.A["grey"])
+
+    def draw_help(self, H, W):
+        y = 0
+        for text, style in HELP:
+            if y >= H:
+                break
+            if style == "legend":
+                A = self.A
+                self.puts(y, 1, [("cache warm ", 0), ("$.05", A["warm"]), (" per step, ", 0), ("12m", A["warmtext"]),
+                                 (" left (", 0), ("4m", A["warn"]), (" running out)   cold ", 0), ("↻$2.5", 0),
+                                 (" to wake it", 0)] if text.endswith("1") else
+                          [("context ", 0), (f"{cs.CTX_WARN // 1000}K+", A["warn"]), (" ", 0), (f"{cs.CTX_CLEAR // 1000}K+", A["clear"]),
+                           ("   ", 0), ("●", A["idle"]), (" idle ", 0), ("●", A["busy"]), (" busy   ", 0),
+                           (f"note {STALE_DAYS + 1}d", A["warn"]), (" stale   ", 0), ("grey", A["grey"]), (" = secondary", 0)])
+            else:
+                self.put(y, 1, text, curses.A_BOLD if style == "bold" else 0)
+            y += 1
 
     # ---- input ----
     def arm_kill(self):
         r = self.cur_row()
         if not r:
             return self.say("select a session to end it", 3)
+        if r.get("orphan"):
+            return self.say("transcript gone - nothing is running to end (Ctrl-X closes the note)", 5)
         lv = r["live"]
         if not lv:
             return self.say("not running - nothing to end", 3)
@@ -412,15 +794,56 @@ class Picker:
         self.confirm = {"keys": {key: lambda: self.do_kill(r["id"])}, "prompt": prompt, "until": time.time() + 8}
 
     def arm_continue(self, r):
-        """Enter on an idle session with a handoff note, or big and cold: a fresh session on its thread, or resume it."""
+        """Enter on an idle session with a handoff note, or big and cold, or whose transcript is gone: a fresh session on its
+        thread (n), or resume it (r). `r` is fresh()."""
         c = r["ctx"]
-        wake = f" ({cs.money(c['wake'])} on the first prompt)" if c and not c["warm"] else ""
-        src = "its handoff note" if r["handoff"] else "a digest of it (made here, free)"
         on = f" on {c['model'].removeprefix('claude-')}" if c and c.get("model") else ""
-        self.confirm = {"keys": {"n": lambda: self.run(lambda: continue_row(r, self.sess)),
-                                 "r": lambda: self.run(lambda: open_row(r, self.sess))},
+        if r["cont"]:
+            if r.get("orphan"):
+                return self.say(f"already continued as {r['cont'][:8]} - Ctrl-X closes this note", 6)
+            self.confirm = {"keys": {"r": lambda: self.run(lambda: self.resume(r))},
+                            "prompt": f"already continued as {r['cont'][:8]}  ·  r = resume this old one anyway  ·  any other key cancels",
+                            "until": time.time() + 20}
+            return
+        if r.get("orphan"):
+            self.confirm = {"keys": {"n": lambda: self.run(lambda: self.continue_(r))},
+                            "prompt": "transcript gone: n = new session from its note  ·  any other key cancels",
+                            "until": time.time() + 20}
+            return
+        wake = f" ({cs.money(c['wake'])} on the first prompt)" if c and not c["warm"] else ""
+        h = r["handoff"]
+        src = ("its handoff note" if h and not h["parked"] and Path(h["path"]).stem == r["id"]
+               else "the thread's note + a digest of this session" if h and not h["parked"] and not r.get("orphan")
+               else "a digest of it (made here, free)")
+        self.confirm = {"keys": {"n": lambda: self.run(lambda: self.continue_(r)),
+                                 "r": lambda: self.run(lambda: self.resume(r))},
                         "prompt": f"n = new session{on} from {src}  ·  r = resume as is{wake}  ·  any other key cancels",
                         "until": time.time() + 20}
+
+    def continue_(self, r):
+        """n: a fresh session on r's thread - checked again first: nobody resumed or continued it in the meantime."""
+        r = self.fresh(r)
+        if r["cont"]:
+            cl = r["cont_live"]
+            how = (f"running, window {cl['window_index']}" if cl and cl["window_index"] is not None else "running" if cl
+                   else "started a moment ago" if r["cont"] in self.launched else "it has a transcript")
+            return f"already continued as {r['cont'][:8]} ({how}) - not starting a second one"
+        if r["live"]:
+            return f"it is running now ({cs.live_label(r, self.sess) or 'outside tmux'}) - Enter jumps there; not starting a second thread"
+        new = str(uuid.uuid4())
+        self.launched[new] = time.time()
+        return continue_row(r, my_session(), new)
+
+    def resume(self, r):
+        """r, or Enter: resume / jump, on running state read just now. A session resumed here in the last RESUME_GRACE s
+        is not resumed again: it may not have registered as running yet."""
+        r = self.fresh(r)
+        if not r["live"] and time.time() - self.launched.get(r["id"], 0) < RESUME_GRACE:
+            return "resumed a moment ago - it is still starting; not opening a second copy"
+        msg = open_row(r, my_session())
+        if not r["live"]:
+            self.launched[r["id"]] = time.time()
+        return msg
 
     def run(self, action):
         try:
@@ -435,24 +858,67 @@ class Picker:
             return self.say("select a session to park it", 3)
         h = r["handoff"]
         if h and h["status"] == "open":
+            if r.get("orphan"):
+                return self.say("transcript gone - its note is open already: Enter then n continues it, Ctrl-X closes it", 6)
             return self.say("already in Open - Enter then n continues it, Ctrl-X marks it done", 5)
+        model = None
         try:
-            cs.set_handoff_status(h["path"], "open") if h else cs.park(r)
+            if h:
+                cs.set_handoff_status(h["path"], "open")
+            else:
+                cs.park(r)
+                model = cs.polish_park_later(r["id"])
         except Exception as e:
             return self.say(f"could not park it: {e}", 10)
         self.refresh()
         warm = r["ctx"] and r["ctx"]["warm"] and r["live"]
-        self.say(f"parked in Open (no AI call): {fit(r['title'], 44)}" + (" - it is warm: /handoff in it would write a fuller note" if warm else ""), 8)
+        how = f"{model} is writing the note from the digest (~15 s)" if model else "no AI call"
+        self.say(f"parked in Open ({how}): {fit(r['title'], 40)}" + (" - it is warm: /handoff in it would write a fuller note" if warm else ""), 8)
 
     def toggle_done(self):
         r = self.cur_row()
-        h = r and r["handoff"]
+        if not r:
+            return self.say("select a session to mark its note done", 3)
+        h = r["handoff"]
         if not h:
             return self.say("no handoff note for this session - run /handoff in it, or Enter then n to continue it from a digest", 6)
         status = "done" if h["status"] == "open" else "open"
-        cs.set_handoff_status(h["path"], status)
+        try:
+            cs.set_handoff_status(h["path"], status)
+        except Exception as e:                   # the note went away (or was rewritten) since the last refresh
+            self.refresh()
+            return self.say(f"could not mark the note {status}: {e}", 8)
         self.refresh()
+        if r.get("orphan") and status == "done":
+            return self.say(f"done: {fit(r['title'], 40)} - its transcript is gone, so it leaves the list (the note stays in {tilde(cs.HANDOFFS)})", 8)
         self.say(f"{'done - it left' if status == 'done' else 'open again - back in'} the Open block: {fit(r['title'], 50)}")
+
+    def view_note(self):
+        """Ctrl-V: the thread's note - or its digest when there is only a parked stub or no note - in a tmux popup."""
+        r = self.cur_row()
+        if not r:
+            return self.say("select a session to read its note", 3)
+        h = r["handoff"]
+        digest = Path(h["path"]).with_name(Path(h["path"]).stem + ".digest.md") if h else cs.HANDOFFS / f"{r['id']}.digest.md"
+        path = (h["path"] if h and not h["parked"] else digest if digest.exists() else h["path"] if h else None)
+        if not path or not os.path.exists(path):
+            return self.say("no handoff note and no digest for this session - Ctrl-T parks it (writes both, no API call)", 6)
+        pane = os.environ.get("TMUX_PANE")
+        if not pane:
+            return self.say(f"not in tmux - read {tilde(path)}", 8)
+        cmd = ["tmux", "display-popup", "-E", "-w", "90%", "-h", "90%", "-t", pane]
+        try:
+            win = tmux("display-message", "-p", "-t", pane, "#{window_id}")
+            clients = [l.split() for l in tmux("list-clients", "-F", "#{client_activity} #{window_id} #{client_name}").splitlines()]
+            mine = sorted((c for c in clients if len(c) == 3 and c[1] == win), reverse=True)
+            if mine:
+                cmd += ["-c", mine[0][2]]            # the client looking at this window, the latest active if several
+        except RuntimeError:
+            pass
+        title = fit(r['title'], 60).replace("#", "##")   # -T is a tmux format: a `#(cmd)` in a title would run
+        cmd += ["-T", f" {title} - q closes ", f"less -R -c {shlex.quote(str(path))}"]
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.say(f"reading {tilde(path)} in a popup - q closes it", 5)
 
     def do_kill(self, sid):
         self.refresh()
@@ -488,6 +954,11 @@ class Picker:
         self.remember()
 
     def key(self, k):
+        if k == curses.KEY_RESIZE:               # redrawn at the new size; a question or the help stays up
+            return
+        if self.help:                            # any key closes the help, and does nothing else
+            self.help = False
+            return
         if self.confirm:                         # second step of Ctrl-K or Enter: one of the asked keys acts, anything else cancels
             c, self.confirm = self.confirm, None
             act = c["keys"].get(k) if isinstance(k, str) else None
@@ -497,6 +968,9 @@ class Picker:
         if isinstance(k, str):
             if k in ("\n", "\r"):
                 return self.activate()
+            if (k == "?" and not self.filter) or k == "\x1f":     # ? (a filter can still contain one) or Ctrl-/
+                self.help = True
+                return
             if k in ("\x7f", "\b"):
                 self.filter = self.filter[:-1]
                 self.force_first = True
@@ -510,6 +984,10 @@ class Picker:
             elif k == "\x07":                    # Ctrl-G: by block / flat
                 self.grouped = not self.grouped
                 self.save_state()
+            elif k == "\x13":                    # Ctrl-S: the sort within blocks
+                self.sort = (self.sort + 1) % len(SORTS)
+                self.save_state()
+                self.say(f"sorted by {SORTS[self.sort]}" + (" (Open: oldest note first)" if SORTS[self.sort] == "recent" else ", highest first"), 3)
             elif k == "\x12":                    # Ctrl-R
                 return self.refresh()
             elif k == "\x0b":                    # Ctrl-K
@@ -518,8 +996,12 @@ class Picker:
                 return self.toggle_done()
             elif k == "\x14":                    # Ctrl-T: park it in Open without waking it
                 return self.park()
+            elif k == "\x16":                    # Ctrl-V: read the note
+                return self.view_note()
             elif k == "\x19":                    # Ctrl-Y
                 r = self.cur_row()
+                if r and r.get("orphan"):
+                    return self.say("transcript gone - no resume command to copy; Enter then n continues from the note", 6)
                 if r:
                     copy_text(resume_cmd(r))
                     self.say(f"copied: {resume_cmd(r)}")
@@ -538,7 +1020,7 @@ class Picker:
             self.apply_filter()
             return
         H = self.scr.getmaxyx()[0]
-        page = max(1, H - 10)
+        page = max(1, H - 11)
         moves = {curses.KEY_DOWN: 1, curses.KEY_UP: -1, curses.KEY_NPAGE: page, curses.KEY_PPAGE: -page}
         if k in moves:
             self.sel += moves[k]
@@ -556,6 +1038,9 @@ class Picker:
             return self.apply_filter()
         elif k == curses.KEY_ENTER:
             return self.activate()
+        elif k == curses.KEY_F1:
+            self.help = True
+            return
         self.remember()
 
     def activate(self):
@@ -564,10 +1049,10 @@ class Picker:
             return
         if it["t"] == "hdr":                     # Enter on a block header folds / unfolds it
             return self.toggle_block(it["b"])
-        r, c = it["r"], it["r"]["ctx"]
-        if not r["live"] and (r["handoff"] or (c and not c["warm"] and c["level"])):
-            return self.arm_continue(r)          # waking it would be dear, or there is a note to start from: ask
-        self.run(lambda: open_row(r, self.sess))
+        r = self.fresh(it["r"])                  # running state as of now, not of the last refresh
+        if not r["live"] and self.asks(r):
+            return self.arm_continue(r)          # a note to start from, waking it would be dear, or nothing to resume: ask
+        self.run(lambda: self.resume(r))
 
     def loop(self):
         while True:
@@ -576,9 +1061,18 @@ class Picker:
                 k = self.scr.get_wch()
             except curses.error:
                 k = None
+            now = time.time()
             if k is not None:
+                if k != curses.KEY_RESIZE:
+                    self.seen, self.seen_at = True, now          # a key: someone is looking
                 self.key(k)
-            elif time.time() - self.last_refresh > REFRESH_S:
+                continue
+            if now - self.seen_at >= VISIBLE_EVERY:
+                was, self.seen, self.seen_at = self.seen, dashlib.visible(), now
+                if self.seen and not was:                       # back on screen: fresh data at once
+                    self.refresh()
+                    continue
+            if self.seen and now - self.last_refresh > REFRESH_S:
                 self.refresh()
 
 

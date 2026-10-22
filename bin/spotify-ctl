@@ -23,5 +23,6 @@ else
 end if
 EOF
 )
+rm -f "$HOME/.claude/dash/shared/spotify.json"   # spotify-panel's shared poll: gone, so the panels re-read Spotify now
 [ -n "$TMUX" ] && tmux display-message -d 2500 "♫ $msg"
 exit 0

@@ -22,7 +22,8 @@ if tmux list-windows -t "=$sess" -F '#W' | grep -qx sessions; then
 fi
 
 if [ -z "$idx" ]; then
-    dash=$(tmux list-windows -t "=$sess" -F '#{window_index} #{window_name}' | awk '$2=="dash"{print $1; exit}')
+    # only a window named exactly "dash" prints its index ("dash notes" would match a split on spaces)
+    dash=$(tmux list-windows -t "=$sess" -F '#{?#{==:#{window_name},dash},#{window_index},}' | grep -m1 .)
     idx=$(( ${dash:--1} + 1 ))
 fi
 # a taken slot needs -b (insert before it, shifting the rest up); a free one must be addressed directly

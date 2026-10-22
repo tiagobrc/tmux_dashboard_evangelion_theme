@@ -11,3 +11,17 @@ WEATHER_LAT=40.7128
 WEATHER_LON=-74.0060
 WEATHER_PLACE=NYC
 WEATHER_TZ=auto
+
+# Session browser, Ctrl-T (park): the model that rewrites the stub note from the transcript digest, in the background
+# (claude -p, no tools, nothing else read; under 1¢ on haiku). off = keep the plain stub, no AI call.
+PARK_MODEL=haiku
+
+# Claude panes. Context (thousand tokens) that turns yellow / red; minutes of warm cache left at which an idle session
+# past CTX_WARN_K gets a tmux nudge (0 = off); monthly budget at API prices (empty = none).
+CTX_WARN_K=200
+CTX_CLEAR_K=400
+NUDGE_MIN=10
+MONTH_BUDGET_USD=
+
+# claude-session-index --weekly: folder for "Claude week <YYYY-Www>.md" (empty = print to the terminal).
+WEEKLY_EXPORT_DIR=

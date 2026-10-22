@@ -5,9 +5,11 @@ Location comes from WEATHER_LAT/LON/PLACE/TZ in ~/.config/tmux-dashboard/config 
 15 min and shares one cache file between dashboards, so several panes = one request.
 Adapts to the pane: 2 rows = now + tomorrow, 3 rows = now + 3-day strip, 4+ rows = one day per line.
 """
-import json, os, re, shutil, signal, sys, tempfile, time, urllib.request
+import json, os, re, shutil, signal, sys, tempfile, time, unicodedata, urllib.request
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dashlib
 
 
 def conf(key, default=""):
@@ -56,15 +58,25 @@ def fit(line, width):
     return "".join(out) + OFF
 
 
+def cells(text):
+    """Visible width: escape codes take no cell, wide glyphs (⚡) two."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in ANSI.sub("", text))
+
+
 def f(c):
-    return c * 9 / 5 + 32
+    return None if c is None else c * 9 / 5 + 32
+
+
+def n(v):
+    """A value to whole units; '?' for a null, which Open-Meteo sends where a model has no value yet."""
+    return "?" if v is None else f"{v:.0f}"
 
 
 def look(code):
     for codes, glyph, colour, word in CODES:
         if code in codes:
             return glyph, colour, word
-    return "?", WHITE, f"code {code}"
+    return "?", WHITE, "no data" if code is None else f"code {code}"
 
 
 def fetch():
@@ -92,12 +104,13 @@ def render():
         c, day = d["current"], d["daily"]
     except (OSError, ValueError, KeyError):
         return "\033[H" + f"{BOLD} Weather{OFF}\033[K\n{DIM} waiting for open-meteo.com…{OFF}\033[K\033[J"
-    g, col, word = look(c["weather_code"])
+    g, col, word = look(c.get("weather_code"))
     age = time.time() - d.get("_fetched", 0)
     stale = f"  {DIM}({int(age // 60)} min old){OFF}" if age > 2 * EVERY else ""
-    details = f"{DIM} · feels {c['apparent_temperature']:.0f}° · {c['relative_humidity_2m']}% · {c['wind_speed_10m']:.0f} km/h{OFF}"
-    tc = c['temperature_2m']
-    now = f" {BOLD}{PLACE}{OFF} {col}{g}{OFF} {BOLD}{tc:.0f}°C{OFF}{DIM}·{f(tc):.0f}°F{OFF} {word}" + (details if cols >= 60 else "") + stale
+    details = (f"{DIM} · feels {n(c.get('apparent_temperature'))}° · {n(c.get('relative_humidity_2m'))}% · "
+               f"{n(c.get('wind_speed_10m'))} km/h{OFF}")
+    tc = c.get("temperature_2m")
+    now = f" {BOLD}{PLACE}{OFF} {col}{g}{OFF} {BOLD}{n(tc)}°C{OFF}{DIM}·{n(f(tc))}°F{OFF} {word}" + (details if cols >= 60 else "") + stale
     days = []
     for i in range(1, len(day["time"])):
         dg, dcol, dword = look(day["weather_code"][i])
@@ -107,12 +120,23 @@ def render():
     out = [now]
     if rows >= 4:
         for name, dg, dcol, dword, hi, lo, rain in days[:rows - 1]:
-            out.append(f" {name} {dcol}{dg}{OFF} {hi:.0f}/{lo:.0f}°C {DIM}{f(hi):.0f}/{f(lo):.0f}°F{OFF} " + (f"{dword:<13}" if cols >= 52 else "")
-                       + f"{DIM}{BLUE if rain >= 50 else ''}☂ {rain}%{OFF}")
+            out.append(f" {name} {dcol}{dg}{OFF} {n(hi)}/{n(lo)}°C {DIM}{n(f(hi))}/{n(f(lo))}°F{OFF} " + (f"{dword:<13}" if cols >= 52 else "")
+                       + f"{DIM}{BLUE if (rain or 0) >= 50 else ''}☂ {n(rain)}%{OFF}")
     else:
-        strip = "  ".join(f"{n} {dc}{dg}{OFF} {hi:.0f}/{lo:.0f}°C{DIM}·{f(hi):.0f}/{f(lo):.0f}°F {BLUE if r >= 50 else ''}☂{r}%{OFF}"
-                           for n, dg, dc, _, hi, lo, r in days[:3 if rows >= 3 else 1])
-        out.append(" " + strip)
+        # whole days only, as many as fit (a cut one reads "Sat ☁ 1"); °C alone when not even one fits with °F
+        for fahrenheit in (True, False):
+            strip, room = [], cols - 2               # the leading space, and the last column every line leaves empty
+            for name, dg, dc, _, hi, lo, r in days[:3 if rows >= 3 else 1]:
+                cell = (f"{name} {dc}{dg}{OFF} {n(hi)}/{n(lo)}°C" + (f"{DIM}·{n(f(hi))}/{n(f(lo))}°F" if fahrenheit else "")
+                        + f" {DIM}{BLUE if (r or 0) >= 50 else ''}☂{n(r)}%{OFF}")
+                need = cells(cell) + (2 if strip else 0)
+                if need > room:
+                    break
+                strip.append(cell)
+                room -= need
+            if strip:
+                break
+        out.append(" " + "  ".join(strip))
     out = [fit(l, cols - 1) for l in out[:max(rows, 1)]]
     return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
 
@@ -121,14 +145,15 @@ if "--once" in sys.argv:
     fetch()
     print(render())
     sys.exit(0)
+screen = dashlib.Screen()
 sys.stdout.write("\033[?25l\033[2J")
-signal.signal(signal.SIGWINCH, lambda *_: (sys.stdout.write(render()), sys.stdout.flush()))   # redraw on pane resize
+wake = dashlib.winch_fd()              # redraw on pane resize, from this loop rather than inside the signal handler
 try:
     while True:
-        fetch()
-        sys.stdout.write(render())
-        sys.stdout.flush()
-        time.sleep(30)
+        fetch()                            # cached for 15 min
+        screen.show(dashlib.safe(render))
+        dashlib.wait(30, wake)
+        screen.show(dashlib.safe(render))  # a resize redraws now, not after a fetch that can take 15 s
 except KeyboardInterrupt:
     pass
 finally:

@@ -142,10 +142,12 @@ def apply_btop(variant):
     name = "Default" if variant == "default" else variant
     if conf.exists():
         conf.write_text(re.sub(r'(?m)^color_theme = .*$', f'color_theme = "{name}"', conf.read_text()))
-    # dashboard btops run under the dash-btop watchdog: end them and they come back themed
-    for line in tmux("list-panes", "-a", "-F", "#{window_name} #{pane_index} #{pane_pid}").stdout.splitlines():
-        wname, idx, pid = line.split()
-        if wname == "dash" and idx == "0":
+    # dashboard btops run under the dash-btop watchdog: end them and they come back themed. Found by command, not
+    # pane index (tmux-dash-layout moves btop in small windows); other windows print an empty line, names are not parsed
+    for line in tmux("list-panes", "-a", "-F",
+                     "#{?#{==:#{window_name},dash},#{pane_pid} #{pane_start_command},}").stdout.splitlines():
+        pid, _, cmd = line.partition(" ")
+        if "dash-btop" in cmd:
             subprocess.run(["pkill", "-TERM", "-P", pid, "-x", "btop"])
 
 
@@ -302,6 +304,7 @@ def main():
     else:
         p = palette(arg)
         colours.write_text(json.dumps({"accent": p["accent"], "second": p["second"], "grey": p["grey"]}) + "\n")
+    subprocess.run(["pkill", "-WINCH", "-f", "clock-panel"], capture_output=True)   # it draws once a minute: repaint now
     STATE.write_text(arg + "\n")
     print(f"theme: {arg}")
 

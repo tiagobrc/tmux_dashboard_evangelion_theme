@@ -86,8 +86,10 @@ try:
 except FileNotFoundError:
     d = {}
 if "statusLine" in d:
+    # The setting may spell the path with ~ or $HOME; expand both before comparing.
+    used = os.path.expandvars(json.dumps(d["statusLine"]).replace("~/", os.path.expanduser("~/")))
     print("statusLine already set in ~/.claude/settings.json - left alone" +
-          ("" if cmd in json.dumps(d["statusLine"]) else " (it does not call claude-statusline, so the usage pane stays empty)"))
+          ("" if cmd in used else " (it does not call claude-statusline, so the usage pane stays empty)"))
 else:
     os.makedirs(os.path.dirname(p), exist_ok=True)
     if os.path.exists(p):

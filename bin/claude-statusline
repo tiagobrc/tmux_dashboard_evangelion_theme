@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -S
 """Claude Code status line + data feed for the tmux dashboard's usage panel.
 
 Claude Code pipes a JSON blob to this script on every status refresh. It holds
@@ -6,15 +6,21 @@ what `/usage` shows (rate_limits: 5-hour / 7-day windows) and the session's
 context-window fill. We (1) save it to ~/.claude/dash/status/<session>.json for
 claude-usage-panel, and (2) print a compact one-line summary for the session.
 No credentials are read and nothing leaves the machine.
+
+Claude Code runs it for every session on every refresh, so it must never fail: python3 -S (no site-packages, none
+needed: a faster start), a bad input prints nothing, and a failed save still prints the line.
 """
-import json, os, sys, tempfile, time
+import json, os, sys, time
 from pathlib import Path
 
 OUT = Path.home() / ".claude" / "dash" / "status"
 
 
 def pct(v):
-    return None if v is None else f"{float(v):.0f}%"
+    try:
+        return None if v is None else f"{float(v):.0f}%"
+    except (TypeError, ValueError):
+        return None
 
 
 def main():
@@ -22,12 +28,14 @@ def main():
         data = json.load(sys.stdin)
     except ValueError:
         return
+    if not isinstance(data, dict):
+        return
     sid = str(data.get("session_id") or "unknown").replace("/", "_")
     data["_saved_at"] = time.time()
     try:
         OUT.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=OUT, prefix=".tmp-")
-        with os.fdopen(fd, "w") as fh:
+        tmp = OUT / f".tmp-{os.getpid()}"
+        with open(tmp, "w") as fh:
             json.dump(data, fh)
         os.replace(tmp, OUT / f"{sid}.json")  # atomic: the panel never sees a half-written file
     except OSError:
@@ -48,4 +56,7 @@ def main():
     print(" · ".join(parts))
 
 
-main()
+try:
+    main()
+except Exception:            # an input of an unexpected shape: no line rather than a traceback in the status bar
+    pass

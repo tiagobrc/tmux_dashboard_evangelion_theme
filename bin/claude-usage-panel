@@ -1,162 +1,386 @@
 #!/usr/bin/env python3
-"""Claude usage widget for the tmux dashboard: plan limits + context per session.
+"""Claude usage widget for the tmux dashboard: plan limits and spend. Context per session is the sessions panel's job.
 
-Reads the JSON that ~/.local/bin/claude-statusline saves for every session
-(~/.claude/dash/status/<session>.json) - the same numbers `/usage` shows.
-Idle sessions keep reporting the limits they last saw, so for each window we
-trust the newest reset time and, within it, the highest percentage (usage only
-grows inside a window).
+The 5-hour and 7-day bars are the plan's rate limits, the numbers `/usage` shows, from the JSON that
+~/.local/bin/claude-statusline saves for every session (~/.claude/dash/status/<session>.json). Idle sessions keep
+reporting the limits they last saw, so for each window we trust the newest reset time and, within it, the highest
+percentage (usage only grows inside a window).
 
-The month line is what this month would have cost at API list prices (what an
-Enterprise or API account is billed), from claude_sessions.spend(): every
-transcript, subagents included, counted in a background thread once a minute.
+Spend is what the transcripts would have cost at API list prices (what an Enterprise or API account is billed), every
+response once, subagents included - claude_sessions, counted in a background thread once a minute:
+
+  Oct $1,210 · pace $1,900 · Sep $1,750   month to date, the whole month at this rate, last month; with
+                                          MONTH_BUDGET_USD set also the share of it (pace past 80% yellow, 100% red)
+  today $120 · 7 days $610 ▆▁▁█▄▄▆        the last 7 days, oldest first
+  top today $45 w12 Gen022830 qPCR prim…  today's costliest session
+  warm now: 2 sessions, $.27/step         what one more step of every warm session costs
+  cache misses, open sessions: …          tokens the running sessions re-sent on cache misses, and why
+
+As many lines as the pane has rows for, in that order of importance (59x3: the bars and the month only); a tall pane
+also gets the 7 days as bars.
+
+Budget alert: with MONTH_BUDGET_USD set, one tmux message to the clients of this panel's tmux session when the month to
+date passes 80% and 100% of it - once per month and threshold across every dashboard (a marker in
+~/.claude/dash/alerts/; CLAUDE_DASH_MARKERS moves the folder, for tests).
 """
-import calendar, json, os, re, shutil, subprocess, sys, threading, time
+import os, re, shutil, signal, subprocess, sys, threading, time, unicodedata
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import claude_sessions as cs
+import dashlib
 
-SPEND_EVERY = 60                                              # seconds between month-to-date recounts
-_spend = {"by": None}
-STATUS = Path.home() / ".claude" / "dash" / "status"
-REGISTRY = Path.home() / ".claude" / "sessions"
-DIM, BOLD, OFF = "\033[2m", "\033[1m", "\033[0m"
-GREEN, YELLOW, RED = "\033[32m", "\033[33m", "\033[31m"
+STATUS = cs.STATUS
+ALERTS = Path(os.environ.get("CLAUDE_DASH_MARKERS") or Path.home() / ".claude" / "dash") / "alerts"
+SPEND_EVERY = 60                                          # seconds between recounts of the spend
+FRAME_EVERY = 5
+BOLD, OFF = "\033[1m", "\033[0m"
+GREY = "\033[37m"                                         # secondary text: dim (\033[2m) is ~2.3:1 on the MAGI orange
+GREEN, YELLOW, RED = "\033[32m", "\033[33m", "\033[91m"
+SPARK = "▁▂▃▄▅▆▇█"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_data = {}                                                # by, budget, days, rows, here: the counting thread's last result
+_poke, _fresh = threading.Event(), threading.Event()
+
+
+def warm_tint():
+    """Warm cache - pays per step right now: the theme's second colour in bold, else bright cyan (as in the other panels)."""
+    return BOLD + dashlib.theme("second", "\033[96m")
+
+
+def _w(ch):
+    return 0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def cells(s):
+    return sum(map(_w, ANSI.sub("", s)))
+
+
+def cut(s, n):
+    if cells(s) <= n:
+        return s
+    out, w = [], 0
+    for ch in s:
+        if w + _w(ch) > n - 1:
+            break
+        out.append(ch)
+        w += _w(ch)
+    return "".join(out) + "…" if n > 0 else ""
+
+
+def clip(line, n):
+    if cells(line) <= n:
+        return line
+    out, w = [], 0
+    for m in re.finditer(r"(\x1b\[[0-9;?]*[A-Za-z])|(.)", line, re.S):
+        if m.group(1):
+            out.append(m.group(1))
+        elif w + _w(m.group(2)) <= n:
+            out.append(m.group(2))
+            w += _w(m.group(2))
+        else:
+            break
+    return "".join(out) + OFF
+
+
+def fit(variants, n):
+    """The first of `variants` (ANSI lines, longest first) that fits in `n` cells; the last one clipped otherwise."""
+    for v in variants:
+        if cells(v) <= n:
+            return v
+    return clip(variants[-1], n)
+
+
+def usd(v):
+    """$1,210 / $8.40 / $0: spend lines, exact enough to compare days."""
+    return f"${v:,.0f}" if v >= 10 else f"${v:.2f}" if v >= 0.005 else "$0"
 
 
 def level(p):
     return GREEN if p < 60 else YELLOW if p < 80 else RED
 
 
-def bar(p, width):
-    full = round(max(0.0, min(100.0, p)) / 100 * width)
-    return f"{level(p)}{'█' * full}{OFF}{DIM}{'░' * (width - full)}{OFF}"
+def share_tint(f):
+    """Share of the monthly budget: yellow from 80%, red from 100%."""
+    return "" if f is None or f < 0.8 else YELLOW if f < 1 else RED
 
 
-def span(seconds):
-    seconds = max(0, int(seconds))
-    d, h, m = seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60
-    return f"{d}d{h:02d}h" if d else f"{h}h{m:02d}m" if h else f"{m}m"
+def bar(fraction, width, tint):
+    full = round(max(0.0, min(1.0, fraction)) * width)
+    return f"{tint}{'█' * full}{OFF}{GREY}{'░' * (width - full)}{OFF}"
 
 
+def tokens(t):
+    return f"{t / 1e3:.0f}K" if t < 999_500 else f"{t / 1e6:.1f}M"
+
+
+# ---- rate limits ----
 def load():
     out = []
     for f in STATUS.glob("*.json"):
         try:
-            out.append(json.loads(f.read_text()))
+            d = cs._read_json(f)                          # re-read only when the file changed
         except (OSError, ValueError):
-            pass
+            continue
+        if isinstance(d, dict):
+            out.append(d)
     return out
 
 
-def live_windows():
-    """{session_id: tmux window index} for Claude processes that are still running."""
-    try:
-        panes = dict(l.split() for l in subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{window_index}"],
-            capture_output=True, text=True).stdout.splitlines())
-    except (OSError, ValueError):
-        panes = {}
-    live = {}
-    for f in REGISTRY.glob("*.json"):
-        try:
-            s = json.loads(f.read_text())
-            os.kill(s["pid"], 0)
-        except (OSError, ValueError, KeyError):
-            continue
-        last = max(s.get("statusUpdatedAt", 0), s.get("updatedAt", 0), s.get("startedAt", 0))
-        live[s.get("sessionId")] = (panes.get(s.get("tmux", "").rpartition(".")[2], "-"), last)
-    return live
-
-
 def limit(status, key, now):
-    best = None
+    """(resets_at, used %) of rate-limit window `key`: the newest reset time any snapshot reports and, among the
+    snapshots of that window (reset within 10 minutes of it), the highest percentage. None without a fresh reading."""
+    got = []
     for s in status:
         w = (s.get("rate_limits") or {}).get(key) or {}
-        if w.get("used_percentage") is None or (w.get("resets_at") or 0) <= now:
+        r, p = w.get("resets_at"), w.get("used_percentage")
+        if isinstance(r, (int, float)) and isinstance(p, (int, float)) and r > now:
+            got.append((r, p))
+    if not got:
+        return None
+    newest = max(r for r, _ in got)
+    return newest, max(p for r, p in got if r >= newest - 600)
+
+
+def limit_lines(status, now, width):
+    """The 5-hour and 7-day lines, and the bar width (the day bars use it too, so every bar starts and ends together)."""
+    got = [(label, limit(status, key, now)) for key, label in (("five_hour", "5-hour"), ("seven_day", "7-day "))]
+    tails = []
+    for _, g in got:
+        if g:
+            resets = g[0]
+            when = time.strftime("%H:%M" if resets - now < 86400 else "%a %H:%M", time.localtime(resets))
+            d = dashlib.dur(resets - now)
+            tails.append([f"resets {when} ({d})", f"{when} ({d})", f"in {d}", ""])
+    # " 7-day  " 8 + bar + " 100%" 5 + " " tail: the longest tail every line has room for beside a bar of 6
+    room = lambda tail: width - 13 - (cells(tail) + 1 if tail else 0)
+    pick = next((i for i in range(4) if all(room(t[i]) >= 6 for t in tails)), 3)
+    bw = max(6, min(24, min([room(t[pick]) for t in tails] + [width - 13])))
+    out, it = [], iter(tails)
+    for label, g in got:
+        if not g:
+            out.append(clip(f" {label} {GREY}no fresh reading yet - use any session once{OFF}", width))
             continue
-        cand = (w["resets_at"], w["used_percentage"])
-        best = max(best, cand) if best else cand
-    return best
+        used, tail = g[1], next(it)[pick]
+        out.append(clip(f" {label} {bar(used / 100, bw, level(used))} {level(used)}{used:3.0f}%{OFF}"
+                        + (f" {GREY}{tail}{OFF}" if tail else ""), width))
+    return out, bw
 
 
-def count_spend():
-    while True:
-        try:
-            _spend["by"] = cs.spend()
-        except Exception:
-            pass                                              # keep the last count; the panel must never die on this
-        time.sleep(SPEND_EVERY)
+# ---- spend ----
+def month_line(width):
+    b, by = _data.get("budget"), _data.get("by")
+    if b is None or by is None:
+        return clip(f"{GREY} month to date: counting the transcripts…{OFF}", width)
+    y, m = map(int, b["month"].split("-"))
+    mon = date(y, m, 1).strftime("%b")
+    prev = date(y - (m == 1), (m - 2) % 12 + 1, 1)
+    last = by.get(prev.strftime("%Y-%m"))
+    mtd = f"{BOLD}{mon} {usd(b['mtd'])}{OFF}"
+    tail = f"{GREY} · {prev.strftime('%b')} {usd(last)}{OFF}" if last else ""
+    if b["budget"]:
+        f, pf = b["fraction"], b["pace_fraction"]
+        share = f"{share_tint(f)}{f:.0%}{OFF}"
+        pace = f"{share_tint(pf)}pace {usd(b['pace'])}"
+        variants = [f" {mtd} = {share} of {usd(b['budget'])} · {pace} ({pf:.0%}){OFF}{tail}",
+                    f" {mtd} = {share} of {usd(b['budget'])} · {pace} ({pf:.0%}){OFF}",
+                    f" {mtd} ({share}) · {pace} ({pf:.0%}){OFF}", f" {mtd} ({share}) · {pace}{OFF}", f" {mtd} ({share})"]
+    else:
+        variants = [f" {mtd} · pace {usd(b['pace'])}{tail}", f" {mtd} · pace {usd(b['pace'])}", f" {mtd}"]
+    return fit(variants, width)
 
 
-def month_line(now, cols):
-    """' Oct at API prices $1,210 · pace $1,900 · Sep $1,750' - pace = so far / share of the month gone."""
-    by = _spend["by"]
-    if by is None:
-        return f"{DIM} month to date: counting the transcripts…{OFF}"
-    lt = time.localtime(now)
-    start = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
-    prev = time.localtime(start - 86400)
-    mtd = by.get(time.strftime("%Y-%m", lt), 0)
-    pace = mtd / max((now - start) / 86400, 0.5) * calendar.monthrange(lt.tm_year, lt.tm_mon)[1]
-    last = by.get(time.strftime("%Y-%m", prev))
-    text = f" {time.strftime('%b', lt)} at API prices {BOLD}${mtd:,.0f}{OFF}{DIM} · pace ${pace:,.0f}"
-    plain = len(f" {time.strftime('%b', lt)} at API prices ${mtd:,.0f} · pace ${pace:,.0f}")
-    extra = f" · {time.strftime('%b', prev)} ${last:,.0f}" if last else ""
-    return text + (extra if plain + len(extra) <= cols - 1 else "") + OFF
+def day_lines(width):
+    """today + last 7 days with a sparkline; today's costliest session; or [] before the first count."""
+    d = _data.get("days")
+    if not d:
+        return []
+    vals = [v for _, v in d["days"]]
+    top = max(vals) or 1
+    spark = "".join(" " if v < 0.005 else SPARK[min(int(v / top * len(SPARK)), len(SPARK) - 1)] for v in vals)
+    out = [fit([f" today {BOLD}{usd(d['today'])}{OFF} · 7 days {usd(d['last7'])} {GREY}{spark}{OFF}",
+                f" today {BOLD}{usd(d['today'])}{OFF} · 7 days {usd(d['last7'])}"], width)]
+    t = d.get("top")
+    if t:
+        r = (_data.get("rows") or {}).get(t["id"]) or {}
+        where = cs.live_label(r, _data.get("here")) if (r.get("live") or {}).get("window_index") is not None else ""
+        head = f" {GREY}top today{OFF} {usd(t['usd'])} {where + ' ' if where else ''}"
+        out.append(head + cut(t["title"], width - cells(head)))
+    return out
+
+
+def warm_line(width, now, tint):
+    """warm now: N sessions and what one more step of all of them costs; the soonest an idle one goes cold."""
+    rows, warm = _data.get("rows") or {}, {}
+    for d in cs.registry():
+        sid = d.get("sessionId")
+        c = cs.context(rows.get(sid) or {"id": sid, "usage": None}, now) if sid else None
+        if c and c["warm"]:
+            warm.setdefault(sid, (c, set()))[1].add(d.get("status"))
+    if not warm:
+        return f"{GREY} warm now: none - every session's cache is cold{OFF}"
+    step = sum(c["step"] for c, _ in warm.values())
+    idle = [c["left"] for c, st in warm.values() if "busy" not in st]
+    n = len(warm)
+    base = f" warm now: {tint}{n} session{'s' * (n != 1)}, {cs.money(step)}/step{OFF}"
+    return fit([base + (f"{GREY} · next cold in {dashlib.dur(min(idle))}{OFF}" if idle else ""), base], width)
+
+
+def miss_line(width):
+    """Tokens the running sessions re-sent on cache misses (per process, from the statusline's prompt_cache), and why."""
+    rows = _data.get("rows") or {}
+    toks, cost, causes = 0, 0.0, {}
+    for r in rows.values():
+        c = r.get("ctx") or {}
+        if r.get("live") and c.get("missed"):
+            toks += c["missed"]
+            cost += c.get("missed_usd") or 0
+            for k, v in (c.get("miss_causes") or {}).items():
+                k = k.split("_")[0]
+                causes[k] = causes.get(k, 0) + (v if isinstance(v, int) else 0)
+    if not toks:
+        return None
+    why = " · ".join(f"{k} {v}" for k, v in sorted(causes.items(), key=lambda kv: -kv[1]))
+    base = f"{GREY} cache misses, open sessions:{OFF} {tokens(toks)} re-sent, {usd(cost)}"
+    return fit([base + (f"{GREY} · {why}{OFF}" if why else ""), base,
+                f"{GREY} cache misses:{OFF} {tokens(toks)} re-sent, {usd(cost)}"], width)
+
+
+def chart_lines(width, bw):
+    """The 7 days as bars lined up with the limit bars, for tall panes."""
+    d = _data.get("days")
+    if not d:
+        return []
+    top = max(v for _, v in d["days"]) or 1
+    out = ["", clip(f"{BOLD} Last 7 days{OFF}{GREY}  at API prices{OFF}", width)]
+    for day, v in d["days"]:
+        label = date.fromisoformat(day).strftime("%a %d")
+        out.append(clip(f" {label} {bar(v / top, bw, '')} {usd(v)}", width))
+    return out
 
 
 def render():
-    cols, rows = shutil.get_terminal_size()
-    now, status, live = time.time(), load(), live_windows()
-    out = [f"{BOLD} Claude usage{OFF}{DIM}  plan limits, as in /usage{OFF}"]
-    bw = max(6, min(24, cols - 41))
-    for key, label in (("five_hour", "5-hour"), ("seven_day", "7-day ")):
-        got = limit(status, key, now)
-        if not got:
-            out.append(f" {label} {DIM}no fresh reading yet - use any session once{OFF}")
-            continue
-        resets, used = got
-        when = time.strftime("%H:%M" if resets - now < 86400 else "%a %H:%M", time.localtime(resets))
-        out.append(f" {label} {bar(used, bw)} {level(used)}{used:3.0f}%{OFF} {DIM}resets {when} ({span(resets - now)}){OFF}")
-    out.append(month_line(now, cols))
-
-    sessions = sorted(((live[s.get("session_id")][0], s) for s in status if s.get("session_id") in live),
-                      key=lambda t: -live[t[1]["session_id"]][1])   # most recently used first, like the sessions panel
-    if sessions:
-        out += ["", f"{BOLD} Context per session{OFF}{DIM}  % of window · prompt cache{OFF}"]
-        cw_bar = max(6, min(18, cols - 36))
-        for win, s in sessions:
-            cw = s.get("context_window") or {}
-            p = cw.get("used_percentage")
-            if p is None:
-                continue
-            model = re.sub(r"^Claude ", "", (s.get("model") or {}).get("display_name") or "?")[:9]
-            pc = s.get("prompt_cache") or {}
-            left = (pc.get("expires_at") or 0) - now
-            warm = pc.get("warm") and left > 0
-            cache = f"warm {span(left)}" if warm else "cold" if pc else ""
-            tint = "\033[38;5;208m" if warm else "\033[38;5;75m"          # orange warm, sky blue cold, as in the sessions panel
-            out.append(f" {win:>2} {bar(p, cw_bar)} {level(p)}{p:3.0f}%{OFF} {model:<9} {tint}{cache}{OFF}")
-        cost = sum((s.get("cost") or {}).get("total_cost_usd") or 0 for _, s in sessions)
-        out.append(f"{DIM} live sessions ≈ ${cost:,.0f} at API prices (covered by the plan){OFF}")
-    out = out[:max(rows, 1)]
-    return "\033[H" + "".join(l + "\033[K\n" for l in out).rstrip("\n") + "\033[J"
+    cols, height = shutil.get_terminal_size()
+    width, now, tint = cols - 1, time.time(), warm_tint()     # never the last column: no pending wrap, no scroll
+    limits, bw = limit_lines(load(), now, width)
+    head = fit([f"{BOLD} Claude usage{OFF}{GREY}  limits as in /usage · $ at API prices{OFF}",
+                f"{BOLD} Claude usage{OFF}{GREY}  as in /usage{OFF}", f"{BOLD} Claude usage{OFF}"], width)
+    days = day_lines(width)
+    misses = miss_line(width)
+    # (importance, position, lines): kept by importance while they fit, drawn by position
+    blocks = [(0, 1, limits[:1]), (1, 2, limits[1:]), (2, 3, [month_line(width)]), (3, 0, [head]),
+              (4, 4, days[:1]), (5, 5, days[1:]), (6, 6, [warm_line(width, now, tint)]),
+              (7, 7, [misses] if misses else []), (8, 8, chart_lines(width, bw))]
+    room, keep = height, []
+    for rank, pos, lines in sorted(blocks):
+        if lines and len(lines) <= room:
+            keep.append((pos, lines))
+            room -= len(lines)
+    out = [l for _, lines in sorted(keep) for l in lines]
+    return "\033[H" + "\033[K\n".join(out) + "\033[K\033[J"
 
 
-if "--once" in sys.argv:
-    _spend["by"] = cs.spend()
-    print(render())
-    sys.exit(0)
-threading.Thread(target=count_spend, daemon=True).start()
-sys.stdout.write("\033[?25l\033[2J")
-try:
+# ---- the counting thread, and the budget alert ----
+def _tmux(*args):
+    try:
+        return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def my_session():
+    pane = os.environ.get("TMUX_PANE")
+    return _tmux("display-message", "-p", "-t", pane, "#{session_name}").strip() or None if pane else None
+
+
+def count(full=True):
+    """Spend and budget; with `full` also the 7 days and the rows (build()) - only while someone looks."""
+    got = {"by": cs.spend(), "budget": cs.budget()}
+    if full:
+        rows = cs.build()
+        got.update(days=cs.spend_days(rows), rows={r["id"]: r for r in rows}, here=my_session())
+    return got
+
+
+def alert(b):
+    """The once-a-month budget messages: when the month to date passes 80% / 100% of MONTH_BUDGET_USD."""
+    if not b or not b["budget"] or not os.environ.get("TMUX_PANE"):
+        return None
+    crossed = [t for t in (80, 100) if b["fraction"] * 100 >= t]
+    if not crossed:
+        return None
+    clients = [c for c in _tmux("list-clients", "-F", "#{client_name}").splitlines() if c]   # every client: see the nudge
+    if not clients:
+        return None                                       # nobody attached anywhere: keep it until someone is
+    new = []
+    for t in crossed:
+        try:
+            ALERTS.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(ALERTS / f"budget-{b['month']}-{t}", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            new.append(t)
+        except OSError:
+            pass
+    if not new:
+        return None
+    try:                                                  # markers of months before the last one go
+        y, m = map(int, b["month"].split("-"))
+        prev = f"{y - (m == 1)}-{(m - 2) % 12 + 1:02d}"
+        for f in ALERTS.glob("budget-*"):
+            if f.name[7:14] < prev:
+                f.unlink()
+    except (OSError, ValueError):
+        pass
+    mon = date(*map(int, b["month"].split("-")), 1).strftime("%b")
+    text = (f"Claude spend: {mon} so far {usd(b['mtd'])} at API prices = {b['fraction']:.0%} of the {usd(b['budget'])} "
+            f"monthly budget (pace {usd(b['pace'])})" + (" - over budget" if max(new) >= 100 else ""))
+    for c in clients:
+        _tmux("display-message", "-d", "10000", "-c", c, text.replace("#", "##").replace("%", "%%"))   # no formats, no strftime
+    return text
+
+
+def counter():
+    def step():
+        got = count(full=dashlib.visible())               # hidden: spend and budget only, for the alert
+        _data.update(got)
+        alert(got["budget"])
     while True:
-        sys.stdout.write(render())
-        sys.stdout.flush()
-        time.sleep(5)
-except KeyboardInterrupt:
-    pass
-finally:
-    sys.stdout.write("\033[?25h\n")
+        dashlib.safe(step)                                # an error is logged once, never ends the thread
+        _fresh.set()
+        _poke.wait(SPEND_EVERY)
+        _poke.clear()
+
+
+def main():
+    if "--once" in sys.argv:                              # one frame, no alerts
+        _data.update(count())
+        print(render())
+        return
+    threading.Thread(target=counter, daemon=True).start()
+    _fresh.wait(3)                                        # the first frame with the spend, when it is quick
+    screen, drawing = dashlib.Screen(), threading.Lock()
+
+    def draw(*_):
+        if drawing.acquire(blocking=False):               # SIGWINCH can land mid-frame
+            try:
+                screen.show(dashlib.safe(render))
+            finally:
+                drawing.release()
+
+    sys.stdout.write("\033[?25l\033[2J")
+    signal.signal(signal.SIGWINCH, draw)                  # redraw on a layout change, not at the next tick
+    try:
+        while True:
+            draw()
+            if dashlib.wait(FRAME_EVERY):                 # back from hidden: recount before drawing
+                _fresh.clear()
+                _poke.set()
+                _fresh.wait(3)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\n")
+
+
+if __name__ == "__main__":
+    main()
