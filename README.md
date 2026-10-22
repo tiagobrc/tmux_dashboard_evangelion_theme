@@ -107,7 +107,8 @@ mouse and Ctrl-C/Z/D and has no quit key; the `pane-died` hook respawns it. "Las
 record, not the file mtime (Claude Code touches every open session's file). Shared code: `claude_sessions.py`.
 
 **Threads** - so a session can be closed without forgetting the task. `/handoff` (the skill in
-`~/.claude/skills/handoff`) writes `~/.claude/handoffs/<sessionId>.md`: front matter (`title`, `status: open|done`,
+`claude/skills/handoff/SKILL.md`, linked into `~/.claude/skills/handoff/` by `install.sh`) writes
+`~/.claude/handoffs/<sessionId>.md`: front matter (`title`, `status: open|done`,
 `next:` the single next action, `continues:`) and Goal / Where it stands / Decisions / Dead ends / Next steps / Key
 files. While a note is open its session sits in the **Open** block at the top of the browser, whatever its folder, with
 the `next:` line in the preview; `/handoff done` or Ctrl-X in the browser closes it (Ctrl-X again reopens). For a
@@ -154,7 +155,7 @@ tmux new -s main                          # the dash window is added automatical
 
 | Flag | Does |
 |---|---|
-| *(none)* | symlinks `bin/*` into `~/.local/bin` and `config/tmux.conf` into `~/.tmux.conf`; creates `~/.config/tmux-dashboard/config`; sets `statusLine` in `~/.claude/settings.json` if unset (backed up first) |
+| *(none)* | symlinks `bin/*` into `~/.local/bin`, `config/tmux.conf` into `~/.tmux.conf` and each file of `claude/skills/<name>/` into `~/.claude/skills/<name>/` (the `/handoff` command); creates `~/.config/tmux-dashboard/config`; sets `statusLine` in `~/.claude/settings.json` if unset (backed up first) |
 | `--brew` | `brew bundle` from `Brewfile` (tmux, btop, macmon, python) |
 | `--theme magi\|eva01\|eva02` | clones SinsuSquid/MAGI-theme into `~/.local/share/dash-theme/` and runs `dash-theme <variant>` (backs up your tmux/btop/iTerm/VS Code configs first; `dash-theme default` reverts) |
 | `--launchd` | installs and starts the lock-screen web mirror (`dash-web`, `http://127.0.0.1:8765/`) |

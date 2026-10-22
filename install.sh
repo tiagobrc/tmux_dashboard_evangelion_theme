@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install the tmux dashboard on a Mac. Idempotent; a regular file in the way is moved aside, never overwritten.
 #
-#   ./install.sh                 link scripts + tmux.conf, create the config file, wire the Claude statusline
+#   ./install.sh                 link scripts + tmux.conf + Claude skills, create the config file, wire the statusline
 #   ./install.sh --brew          also `brew bundle` the dependencies (tmux btop macmon python)
 #   ./install.sh --theme magi    also fetch the MAGI theme files and apply the variant (magi|eva01|eva02)
 #   ./install.sh --launchd       also install + start the lock-screen web mirror (dash-web)
@@ -56,6 +56,19 @@ dest=~/.tmux.conf
 [ -e "$dest" ] && [ ! -L "$dest" ] && mv "$dest" "$dest.bak-$(date +%Y%m%d)"
 ln -sfn "$here/config/tmux.conf" "$dest"
 
+# ---- Claude Code skills (/handoff writes the notes behind the session browser's Open block) ----------------------
+# Each file is linked into a real ~/.claude/skills/<name>/ folder: a linked folder may not be picked up as a skill.
+# An identical copy in the way is replaced; a different one is moved aside.
+for d in "$here"/claude/skills/*/; do
+    name=$(basename "$d")
+    mkdir -p ~/.claude/skills/"$name"
+    for f in "$d"*; do
+        dest=~/.claude/skills/$name/$(basename "$f")
+        if [ -e "$dest" ] && [ ! -L "$dest" ] && ! cmp -s "$f" "$dest"; then mv "$dest" "$dest.bak-$(date +%Y%m%d)"; fi
+        ln -sfn "$f" "$dest"
+    done
+done
+
 # ---- per-machine settings ----------------------------------------------------------------------------------------
 conf=~/.config/tmux-dashboard/config
 if [ ! -e "$conf" ]; then
@@ -106,6 +119,7 @@ if [ "$launchd" = 1 ]; then
 fi
 
 echo
-echo "Done. Linked $(ls "$here/bin" | wc -l | tr -d ' ') scripts into ~/.local/bin and config/tmux.conf into ~/.tmux.conf."
+echo "Done. Linked $(ls "$here/bin" | wc -l | tr -d ' ') scripts into ~/.local/bin, config/tmux.conf into ~/.tmux.conf and the" \
+     "$(ls "$here/claude/skills" | tr '\n' ' ')skill(s) into ~/.claude/skills."
 [ "${#extras[@]}" -gt 0 ] && printf 'Optional, not found: %s\n' "${extras[@]}"
 echo "Next: make sure ~/.local/bin is on PATH, then  tmux new -s main  (the dash window appears; prefix+g jumps to it)."
