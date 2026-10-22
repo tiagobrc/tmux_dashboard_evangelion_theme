@@ -119,7 +119,12 @@ can no longer be resumed or restored; its spend still counts if the dashboard ha
   goes cold.
 - **Spend index.** The memory that counting spend takes in each process that shows spend (both panels and the browser,
   per dashboard), and the size of its file.
-- A short pane keeps the most important lines. A tall one also gets the 7 days as bars.
+- **Spend by month.** In a tall pane, bars in the theme's colour fill the rows down to the clock:
+  - one bar per month, with its total above it;
+  - this month is solid up to today and shaded (`░`) up to its pace;
+  - a set budget is a red dotted line.
+- A short pane keeps the most important lines. With 7 rows to spare it adds the month bars, and with 9 more the last
+  7 days.
 
 In a tall window the usage pane has room for every line:
 
@@ -245,8 +250,21 @@ Close a session without losing its task.
 ## Themes
 
 - `dash-theme magi|eva01|eva02|default` switches tmux, btop, iTerm and VS Code together.
-- MAGI turns the dashboard orange; Claude's own windows keep their colours.
+- MAGI turns the whole dashboard orange; Claude's own windows keep their colours.
+- EVA-01 and EVA-02 colour btop, the clock, the status bar and the terminal, and leave panel text plain.
+- `default` goes back to tmux's green status bar, btop's own colours and your terminal's palette.
 - The themes need the MAGI-theme files, which `install.sh --theme` fetches.
+
+<table>
+<tr>
+<td><img src="docs/img/dashboard.png" alt="MAGI theme" width="420"><br>MAGI</td>
+<td><img src="docs/img/theme-eva01.png" alt="EVA-01 theme" width="420"><br>EVA-01</td>
+</tr>
+<tr>
+<td><img src="docs/img/theme-eva02.png" alt="EVA-02 theme" width="420"><br>EVA-02</td>
+<td><img src="docs/img/theme-default.png" alt="default look" width="420"><br>default</td>
+</tr>
+</table>
 
 ## Settings
 

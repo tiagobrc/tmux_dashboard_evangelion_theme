@@ -19,8 +19,9 @@ response once, subagents included - claude_sessions, counted in a background thr
                                           its own copy), the index file, and the responses of the last hour, which
                                           are kept whole until their transcript is summed
 
-As many lines as the pane has rows for, in that order of importance (59x3: the bars and the month only); a tall pane
-also gets the 7 days as bars, and the index line last of all.
+As many lines as the pane has rows for, in that order of importance (59x3: the bars and the month only). The rows left
+go to graphics: from 7 rows the spend by month as bars in the theme's accent, each with its total (this month solid
+up to date and shaded up to its pace, MONTH_BUDGET_USD a red dotted line), then, when 9 more are free, the 7 days.
 
 Budget alert: with MONTH_BUDGET_USD set, one tmux message to the clients of this panel's tmux session when the month to
 date passes 80% and 100% of it - once per month and threshold across every dashboard (a marker in
@@ -42,6 +43,7 @@ BOLD, OFF = "\033[1m", "\033[0m"
 GREY = "\033[37m"                                         # secondary text: dim (\033[2m) is ~2.3:1 on the MAGI orange
 GREEN, YELLOW, RED = "\033[32m", "\033[33m", "\033[91m"
 SPARK = "▁▂▃▄▅▆▇█"
+PLOT_ROWS = (7, 16)                                       # the month plot's height: at least, at most
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _data = {}                                                # by, budget, days, rows, here: the counting thread's last result
 _poke, _fresh = threading.Event(), threading.Event()
@@ -276,6 +278,91 @@ def chart_lines(width, bw):
     return out
 
 
+def _months(first, last):
+    """'YYYY-MM' from `first` to `last`, both included."""
+    y, m = map(int, first.split("-"))
+    out = []
+    while f"{y}-{m:02d}" <= last:
+        out.append(f"{y}-{m:02d}")
+        y, m = y + (m == 12), m % 12 + 1
+    return out
+
+
+def month_plot(width, rows):
+    """Spend by month as bars, `rows` tall, each month's total above its bar, in the theme's accent: this month solid up
+    to date and shaded (░) up to its pace, MONTH_BUDGET_USD a red dotted line. [] before a month has finished."""
+    b, by = _data.get("budget"), _data.get("by")
+    if not b or not by or rows < PLOT_ROWS[0]:
+        return []
+    cur = b["month"]
+    done = [k for k, v in by.items() if k < cur and v >= 0.005]
+    if not done:
+        return []
+    cols = width - 2                                      # a free cell on each side
+    months = _months(min(done), cur)
+    months = months[-max(2, min(24, (cols + 2) // 5)):]   # bars at least 3 cells wide while they fit
+    n = len(months)
+    gap = 2 if n > 6 else 3
+    w = min(9, (cols - gap * (n - 1)) // n)
+    if w < 1:
+        return []
+    left = (cols - n * w - (n - 1) * gap) // 2            # the bars centred
+    budget, pace = b["budget"] or 0, max(b["pace"], b["mtd"])
+    vals = [by.get(k, 0) for k in months[:-1]] + [b["mtd"]]
+    plot = rows - 4                                       # blank, title, base line and month rows around the bars
+    top = max(vals + [pace, budget]) or 1
+    h = lambda v: max(v >= 0.005, round(v / top * (plot - 1) * 8))   # in eighths of a row; the top row is for labels
+    accent = dashlib.theme("accent", YELLOW)
+    grid = {}                                             # (row from the bottom, column): (character, colour)
+    labels = []
+    for i, v in enumerate(vals):
+        x0, hv = left + i * (w + gap), h(v)
+        for r in range(hv // 8):
+            grid.update({(r, x0 + c): ("█", accent) for c in range(w)})
+        if hv % 8:
+            grid.update({(hv // 8, x0 + c): (" ▁▂▃▄▅▆▇"[hv % 8], accent) for c in range(w)})
+        hp = h(pace) if i == n - 1 else hv
+        for r in range(-(-hv // 8), -(-hp // 8)):        # this month: shaded from the date up to its pace
+            grid.update({(r, x0 + c): ("░", accent) for c in range(w)})
+        if v >= 0.005:
+            text = cs.money(pace if i == n - 1 else v)
+            labels.append((-(-hp // 8), max(0, min(x0 + (w - len(text)) // 2, cols - len(text))), text,
+                           accent if i == n - 1 else GREY))
+    for r, at, text, tint in labels:                      # a total goes above its bar, where nothing else is
+        if r < plot and all((r, at + c) not in grid for c in range(-1, len(text) + 1)):
+            grid.update({(r, at + c): (ch, tint) for c, ch in enumerate(text)})
+    if budget:
+        r = min(plot - 1, h(budget) // 8)
+        grid.update({(r, c): ("┈", RED) for c in range(cols) if (r, c) not in grid})
+    legend = f"{accent}░{GREY} {date(*map(int, cur.split('-')), 1):%b} pace" + (f" · {RED}┈{GREY} budget" if budget else "")
+    out = ["", fit([f"{BOLD} Spend by month{OFF}{GREY}  at API prices · {legend}{OFF}", f"{BOLD} Spend by month{OFF}{GREY}  {legend}{OFF}",
+                    f"{BOLD} Spend by month{OFF}"], width)]
+    for r in range(plot - 1, -1, -1):
+        line, tint = " ", ""
+        for c in range(cols):
+            ch, t = grid.get((r, c), (" ", ""))
+            if t != tint:
+                line += (OFF + t) if t else OFF
+                tint = t
+            line += ch
+        out.append(line + OFF)
+    names, placed = "", []                                # (column, name) of the month names that fit
+    for i, k in enumerate(months):
+        name = date(*map(int, k.split("-")), 1).strftime("%b'%y" if k.endswith("-01") and i else "%b")
+        at = max(0, min(left + i * (w + gap) + (w - len(name)) // 2, cols + 1 - len(name)))   # centred under its bar
+        if i == n - 1:                                    # the current month always gets its name
+            while placed and placed[-1][0] + len(placed[-1][1]) >= at:
+                placed.pop()
+        elif placed and placed[-1][0] + len(placed[-1][1]) >= at:
+            continue
+        placed.append((at, name))
+    for at, name in placed:
+        names += " " * (at - len(names)) + name
+    out.append(f" {' ' * left}{GREY}{'─' * (n * w + (n - 1) * gap)}{OFF}")
+    out.append(f" {GREY}{names}{OFF}")
+    return out
+
+
 def render():
     cols, height = shutil.get_terminal_size()
     width, now, tint = cols - 1, time.time(), warm_tint()     # never the last column: no pending wrap, no scroll
@@ -287,12 +374,18 @@ def render():
     # (importance, position, lines): kept by importance while they fit, drawn by position
     blocks = [(0, 1, limits[:1]), (1, 2, limits[1:]), (2, 3, [month_line(width)]), (3, 0, [head]),
               (4, 4, days[:1]), (5, 5, days[1:]), (6, 6, [warm_line(width, now, tint)]),
-              (7, 7, [misses] if misses else []), (8, 8, chart_lines(width, bw)), (9, 9, [index] if index else [])]
+              (7, 7, [misses] if misses else []), (8, 8, [index] if index else [])]
     room, keep = height, []
     for rank, pos, lines in sorted(blocks):
         if lines and len(lines) <= room:
             keep.append((pos, lines))
             room -= len(lines)
+    # the rows left: the months as a line plot first (the 7 days are in the spark line already), then the 7 days as bars
+    bars = chart_lines(width, bw)
+    plot = month_plot(width, min(room - (len(bars) if room - len(bars) >= PLOT_ROWS[0] else 0), PLOT_ROWS[1]))
+    if room - len(plot) >= len(bars) > 0:
+        keep.append((9, bars))
+    keep.append((10, plot))
     out = [l for _, lines in sorted(keep) for l in lines]
     return "\033[H" + "\033[K\n".join(out) + "\033[K\033[J"
 

@@ -1,5 +1,22 @@
 # tmux-dashboard news
 
+## 2026-10-22: spend by month as bars, theme screenshots
+
+- **Spend by month.** The usage pane draws each month's spend as bars when it has 7 rows to spare: on a portrait
+  screen, between its text and the clock.
+  - The bars are in the theme's accent colour (MAGI orange), each with its total above it.
+  - This month is solid up to today and shaded (`░`) up to its pace. `MONTH_BUDGET_USD` is a red dotted line.
+  - The month bars come before the 7-day bars, which now need 9 more rows: the 7 days are in the spark line already.
+  - The wide dash's usage pane has 4 rows, so the month bars never show there.
+- **Theme screenshots.** The README shows MAGI, EVA-01, EVA-02 and default side by side, plus a portrait dash
+  (119x94, a portrait monitor) where the usage pane has room for the month bars.
+  - `demo/make-screenshots` themes its sandbox with `dash-theme`'s tmux and btop code only, aimed at the fake HOME and
+    the demo tmux server. The iTerm, VS Code and shell-colour steps never run.
+  - Before changing anything, it checks that every file it would write is inside the fake HOME.
+  - The demo now has eight months of made-up history, so the month bars have something to show.
+  - Block characters are drawn as filled boxes, as iTerm draws them, so bars have no gaps between rows.
+  - It takes about 5 minutes.
+
 ## 2026-10-22: spend index size, a shorter README, screenshots
 
 - **Spend index size.** The usage pane's last line shows what counting spend takes:

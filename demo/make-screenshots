@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""The README screenshots, from a demo with made-up data: docs/img/dashboard.png, session-browser.png and
-dashboard-narrow.png.
+"""The README screenshots, from a demo with made-up data: docs/img/dashboard.png, session-browser.png,
+dashboard-narrow.png (a portrait screen, 119x94) and theme-eva01.png, theme-eva02.png, theme-default.png (the other
+dash-theme variants; only their tmux, btop and colour files are switched, inside the demo - see THEME_DRIVER).
 
 Everything happens in a work folder (a new temp folder, or --work DIR):
   - a fake HOME holding invented Claude sessions (transcripts, handoff notes, rate limits, running processes), SLURM
@@ -29,7 +30,9 @@ CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 FONT_PX, ADVANCE = 14, 0.60205                            # Menlo: every glyph is 0.60205 em wide
 LINE_PX = 17
-SHAPES = {"\ue0b0": "polygon(0 0,100% 50%,0 100%)", "\ue0b2": "polygon(100% 0,0 50%,100% 100%)"}   # powerline arrows
+SHAPES = {"\ue0b0": "polygon(0 0,100% 50%,0 100%)", "\ue0b2": "polygon(100% 0,0 50%,100% 100%)",   # powerline arrows
+          **{ch: f"inset({100 - 12.5 * k:g}% 0 0 0)" for k, ch in enumerate("\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588", 1)},       # block elements fill
+          "\u2580": "inset(0 0 50% 0)", "\u258c": "inset(0 50% 0 0)", "\u2590": "inset(0 0 0 50%)"}               # the whole cell, as in iTerm
 SCALE = 1                                                 # 200 columns are 1687 px: already 2x a README's width
 # (title, folder under HOME ("" = HOME), model, context K, $ spent, minutes since the last step, days it ran, running);
 # running = (registry status, the jobs its process runs) for sessions open in a tmux window. Experiment codes end in 30
@@ -54,6 +57,16 @@ SESSIONS = [
     ("Lineage tree figure for lab meeting", "Lab/Exp090830", OPUS, 388, 640, 47500, 12, None),
     ("Sequencing run QC report", "Lab/Seq091030", OPUS, 301, 530, 44600, 8, None),
     ("Primer database cleanup", "Lab/Gen090330", OPUS, 176, 310, 51800, 6, None),
+]
+# Finished months before those, one session each, so the usage pane's month plot has a line to draw:
+# (months back, title, folder, model, context K, $ spent)
+HISTORY = [
+    (7, "Antibody panel design notes", "Lab/Exp031830", OPUS, 300, 380),
+    (6, "Mouse cohort randomisation", "Lab/Exp041530", OPUS, 320, 620),
+    (5, "Bulk RNA-seq differential expression", "Lab/Seq051230", OPUS, 420, 1040),
+    (4, "qPCR primer efficiency curves", "Lab/Gen061030", OPUS, 380, 870),
+    (3, "BCR repertoire diversity metrics", "Lab/Exp072430", OPUS, 460, 1520),
+    (2, "Histology image pipeline", "Lab/Exp080530", OPUS, 480, 1960),
 ]
 PROMPTS = {"Genotyping plate map for litter 12": ("Lay out plate 2 for litter 12: 24 pups, 3 primer sets",
                                                     "Add the no-template controls to column 12"),
@@ -121,6 +134,17 @@ def transcript(path, title, cwd, model, ctx_k, spent, start, last, entry):
     return lines[-3]["message"]["usage"]
 
 
+def history(now):
+    """HISTORY as SESSIONS rows: each session ran for two weeks early in its month."""
+    out = []
+    for back, title, folder, model, ctx_k, spent in HISTORY:
+        t = time.localtime(now)
+        y, m = divmod(t.tm_year * 12 + t.tm_mon - 1 - back, 12)
+        last = time.mktime((y, m + 1, 1, 12, 0, 0, 0, 0, -1)) + 17 * 86400
+        out.append((title, folder, model, ctx_k, spent, (now - last) / 60, 14, None))
+    return out
+
+
 def build_home(home, now):
     """The fake HOME: links to this repo, the theme, the config, and every invented session."""
     for d in (".local/bin", ".local/share/dash-theme", ".tmux", ".config/tmux-dashboard", ".config/btop/themes",
@@ -153,7 +177,7 @@ def build_home(home, now):
         "SLURM_HOST=cluster\nSLURM_USER=demo\nWEATHER_LAT=35.6762\nWEATHER_LON=139.6503\nWEATHER_PLACE=Tokyo\n"
         "WEATHER_TZ=auto\nMONTH_BUDGET_USD=2500\nNUDGE_MIN=0\nPARK_MODEL=off\n")
     running = []
-    for title, folder, model, ctx_k, spent, ago, days, run in SESSIONS:
+    for title, folder, model, ctx_k, spent, ago, days, run in SESSIONS + history(now):
         cwd = home / folder if folder else home
         cwd.mkdir(parents=True, exist_ok=True)
         last = now - ago * 60
@@ -207,6 +231,37 @@ def job_cmd(kind):
             "$0 = \"claude\"; sleep 1e7'")
 
 
+# Switches the demo to another dash-theme variant, in a process whose HOME is the fake one: only dash-theme's tmux and
+# btop parts and the colour files the panels read. main() is never run - it would also theme iTerm (its preferences
+# ignore HOME) and VS Code - and dash-theme's tmux() is pointed at the demo server's socket.
+THEME_DRIVER = r'''
+import json, os, subprocess, sys
+from pathlib import Path
+path, variant, socket = sys.argv[1:4]
+home = Path(os.environ["HOME"]).resolve()
+body, last = Path(path).read_text().rstrip().rsplit("\n", 1)
+if last.strip() != "main()":
+    sys.exit("dash-theme no longer ends with main(): not running it")
+ns = {"__name__": "dash_theme_demo", "__file__": path}
+exec(compile(body, path, "exec"), ns)                          # the definitions only
+ns["tmux"] = lambda *a: subprocess.run(["tmux", "-S", socket, *a], capture_output=True, text=True)
+for name in ("BASE", "STATE", "TMUX_THEME", "BTOP_DIR"):        # all that apply_tmux and apply_btop write
+    if not Path(ns[name]).resolve().is_relative_to(home):
+        sys.exit(f"dash-theme would write {ns[name]}, outside the demo HOME")
+conf = Path(ns["TMUX_CONF"]).read_text()                       # a link into the repo: it must not be appended to
+if "source-file -q ~/.tmux/theme.conf" not in conf or "dash-theme paint" not in conf:
+    sys.exit("dash-theme would append to tmux.conf")
+if ns["tmux"]("display-message", "-p", "#{socket_path}").stdout.strip() != socket:
+    sys.exit("not the demo tmux server")
+ns["apply_tmux"](variant)
+ns["apply_btop"](variant)
+base, p = Path(ns["BASE"]), None if variant == "default" else ns["palette"](variant)
+(base / "colours.json").write_text(json.dumps({k: p[k] for k in ("accent", "second", "grey")}) + "\n" if p else "{}\n")
+(base / "paint.esc").write_text(ns["palette_escapes"](variant))   # the terminal palette the screenshot is drawn in
+Path(ns["STATE"]).write_text(variant + "\n")
+'''
+
+
 class Demo:
     def __init__(self, work):
         self.work, self.home = work, work / "home"
@@ -245,6 +300,14 @@ class Demo:
             (self.home / ".claude/sessions" / f"{pid}.json").write_text(json.dumps({
                 "pid": int(pid), "sessionId": sid, "cwd": cwd, "kind": "interactive", "entrypoint": "cli",
                 "tmux": f"lab:{wid}.{pane}", "status": run[0], "updatedAt": ms, "statusUpdatedAt": ms}))
+
+    def theme(self, variant):
+        """Switch to a dash-theme variant (see THEME_DRIVER); btop restarts in it under its watchdog."""
+        socket = self.tmux("display-message", "-p", "#{socket_path}").strip()
+        r = subprocess.run([sys.executable, "-c", THEME_DRIVER, str(REPO / "bin/dash-theme"), variant, socket],
+                           env=dict(self.env, TMUX=f"{socket},0,0"), capture_output=True, text=True, timeout=60)
+        if r.returncode or not socket.endswith("/" + SOCKET):
+            sys.exit(f"theme {variant}: {(r.stderr or r.stdout).strip()}")
 
     def stop(self):
         self.tmux("kill-server")
@@ -288,8 +351,12 @@ def to_html(screen, pal):
                   (";text-decoration:underline" if ch.underscore else "")
             cls = styles.setdefault(css, f"s{len(styles)}")
             text = ch.data or " "
-            if text in SHAPES:                                # powerline arrows: iTerm draws them itself, Menlo has none
-                spans.append([cls, text, False, 1])
+            if text in SHAPES:                                # drawn, not typed: Menlo has no powerline arrows, and its
+                                                              # blocks leave a gap between rows that iTerm does not;
+                if text not in "" and spans and spans[-1][:3] == [cls, text, False]:
+                    spans[-1][3] += 1                         # a run of one block is one box: no seams between cells
+                else:
+                    spans.append([cls, text, False, 1])
                 x += 1
                 continue
             wide = x + 1 < screen.columns and line[x + 1].data == ""
@@ -368,7 +435,8 @@ def terminal(cols, rows):
 
 
 def capture(demo, out, plan):
-    """Attach a client and follow `plan`: ("wait", s), ("tmux", args), ("size", (cols, rows)), ("snap", name)."""
+    """Attach a client and follow `plan`: ("wait", s), ("tmux", args), ("size", (cols, rows)), ("theme", variant),
+    ("snap", name)."""
     cols, rows = plan[0][1]
     screen, feed = terminal(cols, rows)
     env = {k: v for k, v in demo.env.items()}
@@ -376,7 +444,7 @@ def capture(demo, out, plan):
     if pid == 0:
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         os.execvpe("tmux", ["tmux", "-L", SOCKET, "attach", "-t", "lab:0"], env)
-    pal, written = palette(demo.home), []
+    written = []
 
     def pump(seconds):
         end = time.time() + seconds
@@ -393,6 +461,9 @@ def capture(demo, out, plan):
             elif step == "tmux":
                 demo.tmux(*arg)
                 pump(0.5)
+            elif step == "theme":
+                demo.theme(arg)
+                pump(1)
             elif step == "size":
                 cols, rows = arg
                 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -402,7 +473,7 @@ def capture(demo, out, plan):
                 demo.tmux("refresh-client")
                 pump(1.5)
                 page = demo.work / f"{arg}.html"
-                page.write_text(to_html(screen, pal))
+                page.write_text(to_html(screen, palette(demo.home)))   # the palette of the theme in use
                 text = "\n".join(screen.display)
                 (demo.work / f"{arg}.txt").write_text(text)
                 leak = private(text)
@@ -445,11 +516,15 @@ def main():
     demo = Demo(work)
     demo.start(time.time())
     try:
-        written = capture(demo, out, [("size", (200, 50)), ("wait", 60), ("snap", "dashboard"),
-                                      ("tmux", ("select-window", "-t", "lab:1")), ("wait", 6),
-                                      ("tmux", ("send-keys", "-t", "lab:1", "Down")), ("wait", 2), ("snap", "session-browser"),
-                                      ("size", (112, 64)), ("tmux", ("select-window", "-t", "lab:0")), ("wait", 25),
-                                      ("snap", "dashboard-narrow")])
+        plan = [("size", (200, 50)), ("wait", 60), ("snap", "dashboard"),
+                ("tmux", ("select-window", "-t", "lab:1")), ("wait", 6),
+                ("tmux", ("send-keys", "-t", "lab:1", "Down")), ("wait", 2), ("snap", "session-browser"),
+                ("size", (119, 94)), ("tmux", ("select-window", "-t", "lab:0")), ("wait", 25),   # a portrait screen
+                ("snap", "dashboard-narrow")]
+        for variant in ("eva01", "eva02", "default"):        # a resize makes every pane redraw, the clock included
+            plan += [("theme", variant), ("size", (199, 50)), ("size", (200, 50)), ("wait", 45),
+                     ("snap", f"theme-{variant}")]
+        written = capture(demo, out, plan)
     finally:
         if not a.keep:
             demo.stop()
