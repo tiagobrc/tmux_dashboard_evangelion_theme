@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HPC SLURM widget for the tmux dashboard: my queue + the last 24 h of finished jobs.
 
-Polls `ssh cluster` (the alias keeps a ControlMaster open, so no new logins):
+Polls `ssh $SLURM_HOST` (the alias keeps a ControlMaster open, so no new logins):
 squeue every 60 s, sacct every 5 min - sacct is slow and hits the accounting DB.
 All dashboards share one cache (~/.claude/dash/slurm.json) behind a lock file,
 so two monitors do not mean two pollers. Fetching runs in a thread; the pane
@@ -105,7 +105,7 @@ def fetch():
             subprocess.run(["ssh", "-o", "BatchMode=yes", HOST, "true"], capture_output=True, timeout=15)
         except subprocess.TimeoutExpired:
             cache["error"] += ": the next try opens a fresh ssh connection"
-            try:   # stop, not exit: the shared master stops taking new sessions, while your open `ssh cluster` shells stay up
+            try:   # stop, not exit: the shared master stops taking new sessions, while your open ssh shells to the cluster stay up
                 subprocess.run(["ssh", "-O", "stop", HOST], capture_output=True, timeout=10)
             except (OSError, subprocess.SubprocessError):
                 pass

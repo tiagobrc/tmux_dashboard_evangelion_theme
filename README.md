@@ -25,7 +25,7 @@ Requirements:
 - For the SLURM pane, an ssh alias that logs in without a password.
 
 ```
-git clone git@github.com:tiagobrc/tmux_dashboard_evangelion_theme.git ~/tmux-dashboard
+git clone https://github.com/tiagobrc/tmux_dashboard_evangelion_theme.git ~/tmux-dashboard
 cd ~/tmux-dashboard
 ./install.sh --check                      # report what is missing, change nothing
 ./install.sh --brew --theme magi          # install deps, link everything, apply the MAGI theme
@@ -198,7 +198,7 @@ title, note age and folder.
 **Blocks.**
 
 - A session's block comes from the experiment code in its folder or title: `Exp011530` goes to Exp, `Gen022830` to
-  Gen, and likewise `Cyt…`, `Seq…`, `TC…`.
+  Gen, and likewise `Cyt…` and `Seq…`. Other prefixes work too; `SESSION_CODES` sets how they are spelled.
 - The order is Open, then Gen, Cyt, Seq and Exp (`SESSION_BLOCK_ORDER`), other codes by recent use, Other, `~`, and
   Auto last.
 - Sessions started in `~` without an experiment code are split by topic, such as `~ Lab work`. The rules live in
@@ -278,6 +278,7 @@ Settings go in `~/.config/tmux-dashboard/config` as `KEY=VALUE` lines. The templ
 | `CTX_WARN_K`, `CTX_CLEAR_K` | 200, 400 | context, in thousands of tokens, that turns yellow or red |
 | `NUDGE_MIN` | 10 | warm minutes left that trigger the nudge; 0 turns it off |
 | `MONTH_BUDGET_USD` | empty | monthly budget at API prices |
+| `SESSION_CODES` | empty | experiment-code prefixes beyond Exp, Gen, Cyt and Seq, spelled as they should appear (`TC,LM`) |
 | `PARK_MODEL` | haiku | the model that writes a parked thread's note; `off` keeps the stub |
 | `WEEKLY_EXPORT_DIR` | empty | where `claude-session-index --weekly` writes `Claude week <YYYY-Www>.md`; empty prints it |
 | `SESSION_BLOCK_ORDER` | Gen,Cyt,Seq,Exp | the browser's block order |

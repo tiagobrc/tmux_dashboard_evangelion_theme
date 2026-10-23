@@ -1,5 +1,14 @@
 # tmux-dashboard news
 
+## 2026-10-23: personal defaults out of the code
+
+- **Topics.** The built-in topic rules for sessions started in `~` are now a generic set. Your own go in
+  `~/.config/tmux-dashboard/topics` (`claude-session-index --print-topics` gives a starting file).
+- **`SESSION_CODES`.** Experiment-code prefixes beyond Exp, Gen, Cyt and Seq are set in the config, spelled as they
+  should appear (`SESSION_CODES=TC,LM`). Before, they were in the code.
+- **Weather.** The default location is the centre of New York; set `WEATHER_LAT`/`WEATHER_LON` for yours.
+- The README clones over https, which needs no GitHub key.
+
 ## 2026-10-22: spend by month as bars, theme screenshots
 
 - **Spend by month.** The usage pane draws each month's spend as bars when it has 7 rows to spare: on a portrait
@@ -186,7 +195,7 @@
   - A hung ssh no longer freezes the panel. A ControlMaster left dead by the Mac sleeping, for example, now times out
     after 90 s.
   - The panel stops the master only when a second probe also times out. It uses `-O stop`, which keeps your open
-    `ssh cluster` shells alive.
+    ssh shells to the cluster alive.
   - squeue and sacct back off and report errors separately, and the last good rows stay on screen.
 - **Weather.** It redraws on resize through a SIGWINCH pipe instead of inside the signal handler, where a frame could
   land in the middle of another. The clock does the same, and `dash-theme` repaints it.

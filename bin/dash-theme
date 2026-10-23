@@ -242,8 +242,8 @@ def apply_iterm(variant):
                 "Badge Color": {**iterm_color(p["accent"]), "Alpha Component": 0.5}}
         prof.update({f"Ansi {i} Color": iterm_color(c) for i, c in enumerate(p["ansi"])})
         profiles.append(prof)
-    # Written once only: you may make the MAGI dynamic profile your iTerm default and mark it "rewritable",
-    # after which iTerm itself saves your edits into this file - regenerating it would throw them away.
+    # Written once only: the MAGI dynamic profile may be your iTerm default and marked "rewritable", after which
+    # iTerm itself saves your edits into this file - regenerating it would throw them away.
     if not ITERM_DYNAMIC.exists():
         ITERM_DYNAMIC.parent.mkdir(parents=True, exist_ok=True)
         ITERM_DYNAMIC.write_text(json.dumps({"Profiles": profiles}, indent=2))

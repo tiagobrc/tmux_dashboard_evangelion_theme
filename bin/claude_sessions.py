@@ -66,7 +66,8 @@ LONG_PRICES = {"claude-haiku-5-5": (100_000, (0.50, 2.50, 0.05))}
 # usage.speed == "fast": every token category costs this multiple (the cache multipliers stack on top).
 FAST_PRICES = {"claude-opus-5": 2, "claude-opus-4-8": 2}      # Opus 5.5 $8/$40, Opus 5 and 4.8 $10/$50
 FAST = "+fast"                                                # tag on the model id of a fast response in the spend index
-# Experiment codes: 2-4 letters + 6 digits (Exp011530, Gen022830 ...). Spelling of the ones we know:
+# Experiment codes: 2-4 letters + 6 digits (Exp011530, Gen022830 ...). Spelling of the ones we know; SESSION_CODES in
+# the config adds more (comma-separated, spelled as they should appear: "TC,LM"), see below setting().
 KNOWN_CODES = {"exp": "Exp", "gen": "Gen", "cyt": "Cyt", "seq": "Seq"}
 DIR_CODE = re.compile(r"([A-Za-z]{2,4})(\d{6})(?!\d)")
 TEXT_CODE = re.compile(r"(?<![A-Za-z])([A-Za-z]{2,4})(\d{6})(?!\d)")
@@ -389,6 +390,9 @@ def setting_num(name, default, kind=int):
             _warned.add(name)
             print(f"tmux-dashboard: {name}={v!r} (environment or {CONFIG}) is not a number - using {default}", file=sys.stderr)
         return default
+
+
+KNOWN_CODES.update((c.lower(), c) for c in (c.strip() for c in setting("SESSION_CODES", "").split(",")) if c)
 
 
 # Every step of a session (each prompt and each tool call is one API request) re-reads its whole context from the cache,

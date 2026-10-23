@@ -12,6 +12,9 @@ WEATHER_LON=-74.0060
 WEATHER_PLACE=NYC
 WEATHER_TZ=auto
 
+# Session browser: experiment-code prefixes beyond Exp, Gen, Cyt, Seq, spelled as they should appear (TC,LM).
+SESSION_CODES=
+
 # Session browser, Ctrl-T (park): the model that rewrites the stub note from the transcript digest, in the background
 # (claude -p, no tools, nothing else read; under 1¢ on haiku). off = keep the plain stub, no AI call.
 PARK_MODEL=haiku
