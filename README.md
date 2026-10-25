@@ -308,3 +308,8 @@ Settings go in `~/.config/tmux-dashboard/config` as `KEY=VALUE` lines. The templ
 | `demo/` | the sandbox that makes the screenshots |
 | `docs/` | how it works, and the screenshots |
 | `saver/` | the "Tmux Dashboard" screensaver, a WKWebView of `dash-web` (on hold) |
+
+## License
+
+MIT, see [LICENSE](LICENSE). The MAGI colours come from [SinsuSquid/MAGI-theme](https://github.com/SinsuSquid/MAGI-theme)
+(also MIT), which `install.sh --theme` clones; it is not part of this repository.
