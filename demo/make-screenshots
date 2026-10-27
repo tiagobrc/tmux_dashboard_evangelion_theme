@@ -256,7 +256,7 @@ if ns["tmux"]("display-message", "-p", "#{socket_path}").stdout.strip() != socke
 ns["apply_tmux"](variant)
 ns["apply_btop"](variant)
 base, p = Path(ns["BASE"]), None if variant == "default" else ns["palette"](variant)
-(base / "colours.json").write_text(json.dumps({k: p[k] for k in ("accent", "second", "grey")}) + "\n" if p else "{}\n")
+(base / "colours.json").write_text(json.dumps({k: p[k] for k in ("accent", "second", "grey", "bg")}) + "\n" if p else "{}\n")
 (base / "paint.esc").write_text(ns["palette_escapes"](variant))   # the terminal palette the screenshot is drawn in
 Path(ns["STATE"]).write_text(variant + "\n")
 '''

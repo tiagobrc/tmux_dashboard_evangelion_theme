@@ -303,7 +303,7 @@ def main():
         colours.write_text("{}\n")
     else:
         p = palette(arg)
-        colours.write_text(json.dumps({"accent": p["accent"], "second": p["second"], "grey": p["grey"]}) + "\n")
+        colours.write_text(json.dumps({"accent": p["accent"], "second": p["second"], "grey": p["grey"], "bg": p["bg"]}) + "\n")
     subprocess.run(["pkill", "-WINCH", "-f", "clock-panel"], capture_output=True)   # it draws once a minute: repaint now
     STATE.write_text(arg + "\n")
     print(f"theme: {arg}")

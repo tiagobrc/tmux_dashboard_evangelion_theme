@@ -1,5 +1,16 @@
 # tmux-dashboard news
 
+## 2026-10-26: no gap in this month's bar, portrait rows split in half
+
+- **Spend by month.** This month's projection is drawn in a faded accent instead of `░`. With `░` there was a gap: the
+  spend to date ends inside a cell (`▁` fills only its bottom eighth), and the shading only started on the row above.
+  The faded colour is a background too, so it fills the rest of that cell. Its top is now drawn to the eighth, like the
+  spend itself; before, it was rounded up to a whole row.
+- `dash-theme` writes the theme's background to `colours.json`, to fade the accent into. Without it, black.
+- **Portrait layout.** Every row now splits in half (59 | 59 on a 119-column screen), so the borders line up. Before,
+  SLURM took 55% and sensors 58 columns. Under 66 columns, SLURM's finished jobs drop the word "ended" before their
+  time, so the time still fits.
+
 ## 2026-10-23: personal defaults out of the code
 
 - **Topics.** The built-in topic rules for sessions started in `~` are now a generic set. Your own go in

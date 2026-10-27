@@ -288,9 +288,17 @@ def _months(first, last):
     return out
 
 
+def projection_tint():
+    """The accent faded 60% into the theme's background, as (foreground, background) escapes. A flat colour rather than
+    ░: the cell where the spend to date ends holds a partial block, and only a background can fill the space above it."""
+    a, b = ((dashlib.theme_hex(k) or d).lstrip("#") for k, d in (("accent", "#cdcd00"), ("bg", "#000000")))
+    rgb = tuple(round(int(a[i:i + 2], 16) * 0.4 + int(b[i:i + 2], 16) * 0.6) for i in (0, 2, 4))
+    return "\033[38;2;%d;%d;%dm" % rgb, "\033[48;2;%d;%d;%dm" % rgb
+
+
 def month_plot(width, rows):
     """Spend by month as bars, `rows` tall, each month's total above its bar, in the theme's accent: this month solid up
-    to date and shaded (░) up to its pace, MONTH_BUDGET_USD a red dotted line. [] before a month has finished."""
+    to date and faded up to its pace, MONTH_BUDGET_USD a red dotted line. [] before a month has finished."""
     b, by = _data.get("budget"), _data.get("by")
     if not b or not by or rows < PLOT_ROWS[0]:
         return []
@@ -313,17 +321,21 @@ def month_plot(width, rows):
     top = max(vals + [pace, budget]) or 1
     h = lambda v: max(v >= 0.005, round(v / top * (plot - 1) * 8))   # in eighths of a row; the top row is for labels
     accent = dashlib.theme("accent", YELLOW)
+    faded, faded_bg = projection_tint()
     grid = {}                                             # (row from the bottom, column): (character, colour)
     labels = []
     for i, v in enumerate(vals):
         x0, hv = left + i * (w + gap), h(v)
-        for r in range(hv // 8):
-            grid.update({(r, x0 + c): ("█", accent) for c in range(w)})
-        if hv % 8:
-            grid.update({(hv // 8, x0 + c): (" ▁▂▃▄▅▆▇"[hv % 8], accent) for c in range(w)})
         hp = h(pace) if i == n - 1 else hv
-        for r in range(-(-hv // 8), -(-hp // 8)):        # this month: shaded from the date up to its pace
-            grid.update({(r, x0 + c): ("░", accent) for c in range(w)})
+        for r in range(-(-hp // 8)):                      # this month: solid up to date, faded from there to its pace
+            solid, total = min(8, max(0, hv - 8 * r)), min(8, hp - 8 * r)
+            if solid == 8:
+                cell = ("█", accent)
+            elif solid:                                   # the faded part fills the rest of the cell when the pace
+                cell = (" ▁▂▃▄▅▆▇"[solid], accent + (faded_bg if 2 * total >= solid + 8 else ""))   # reaches half of it
+            else:
+                cell = (" ▁▂▃▄▅▆▇█"[total], faded)
+            grid.update({(r, x0 + c): cell for c in range(w)})
         if v >= 0.005:
             text = cs.money(pace if i == n - 1 else v)
             labels.append((-(-hp // 8), max(0, min(x0 + (w - len(text)) // 2, cols - len(text))), text,
@@ -334,7 +346,7 @@ def month_plot(width, rows):
     if budget:
         r = min(plot - 1, h(budget) // 8)
         grid.update({(r, c): ("┈", RED) for c in range(cols) if (r, c) not in grid})
-    legend = f"{accent}░{GREY} {date(*map(int, cur.split('-')), 1):%b} pace" + (f" · {RED}┈{GREY} budget" if budget else "")
+    legend = f"{faded}█{GREY} {date(*map(int, cur.split('-')), 1):%b} pace" + (f" · {RED}┈{GREY} budget" if budget else "")
     out = ["", fit([f"{BOLD} Spend by month{OFF}{GREY}  at API prices · {legend}{OFF}", f"{BOLD} Spend by month{OFF}{GREY}  {legend}{OFF}",
                     f"{BOLD} Spend by month{OFF}"], width)]
     for r in range(plot - 1, -1, -1):

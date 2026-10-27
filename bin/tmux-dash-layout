@@ -124,13 +124,12 @@ def tall(W, H, jobs):
               [(SENS, 10), (SLURM, 6), (SENS, 13), (SLURM, 8), (BTOP, BTOP_MAX), (SLURM, 12), (SESS, H)])
     if W < BTOP_W or not r:
         return None
-    sens_w = min(58, W // 2)
     b = share(r[SENS], {CLOCK: 2, WX: 2, SPOT: 2}, [(CLOCK, 5), (WX, 4), (WX, H)])
-    sw = min(max(60, W * 11 // 20), W - 37)      # SLURM keeps the wider half (its columns need ~60), local jobs >= 36
+    half = W // 2                                # every row splits at the same column, so the borders line up
     return ("[", [(r[BTOP], BTOP),
-                  (r[SLURM], ("{", [(sw, SLURM), (None, jobs)])),
-                  (r[SESS], ("{", [(W // 2, SESS), (None, USAGE)])),
-                  (None, ("{", [(sens_w, SENS), (None, ("[", [(b[CLOCK], CLOCK), (b[WX], WX), (None, SPOT)]))]))])
+                  (r[SLURM], ("{", [(half, SLURM), (None, jobs)])),
+                  (r[SESS], ("{", [(half, SESS), (None, USAGE)])),
+                  (None, ("{", [(half, SENS), (None, ("[", [(b[CLOCK], CLOCK), (b[WX], WX), (None, SPOT)]))]))])
 
 
 def compact(W, H, jobs):

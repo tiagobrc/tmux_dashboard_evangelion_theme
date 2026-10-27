@@ -157,9 +157,10 @@ def render():
     cancelled = sum(1 for r in done if r[2].startswith("CANCELLED"))
     fresh = f"updated {dashlib.dur(now - c['squeue_at'])} ago" if c.get("squeue_at") else "waiting for first reply…"
     wide = cols >= 120
-    head = (f"{BOLD} HPC · SLURM{OFF}" + (f"{DIM}  {USER}@{HOST}{OFF}" if wide else "") + f"   {CYAN}▶ {running} running{OFF} · "
-            f"{YELLOW}◷ {len(queue) - running} queued{OFF}   {DIM}24h:{OFF} {GREEN}✔ {ok}{OFF}  "
-            f"{RED if bad else DIM}✘ {bad}{OFF}  {DIM}⊘ {cancelled}" + (" cancelled" if wide else "") + f"   {fresh}{OFF}")
+    gap, sep = ("   ", "  ") if cols >= 66 else ("  ", " ")    # tighter in half a portrait dash, so the counts still fit
+    head = (f"{BOLD} HPC · SLURM{OFF}" + (f"{DIM}  {USER}@{HOST}{OFF}" if wide else "") + f"{gap}{CYAN}▶ {running} running{OFF} · "
+            f"{YELLOW}◷ {len(queue) - running} queued{OFF}{gap}{DIM}24h:{OFF} {GREEN}✔ {ok}{OFF}{sep}"
+            f"{RED if bad else DIM}✘ {bad}{OFF}{sep}{DIM}⊘ {cancelled}" + (" cancelled" if wide else "") + f"{gap}{fresh}{OFF}")
     out = [head]
     if c.get("error"):
         out.append(f" {RED}{clip(c['error'], cols - 2)}{OFF}")
@@ -180,7 +181,8 @@ def render():
         colour, mark = (GREEN, "✔") if word == "COMPLETED" else (RED, "✘") if word in BAD else (DIM, "⊘")
         when = end[11:16] if end[:10] == time.strftime("%Y-%m-%d") else end[5:16].replace("T", " ")
         out.append(f" {colour}{mark} {jid:<9}{OFF} {clip(name, name_w):<{name_w}} {colour}{word.lower():<10}{OFF} "
-                   f"{elapsed:>10}   {DIM}ended {when:<11}" + (f" {clip(part, 18)}" if show_part else "") + OFF)
+                   f"{elapsed:>10}" + (f"   {DIM}ended {when:<11}" if cols >= 66 else f"  {DIM}{when:<11}")   # 59: half a
+                   + (f" {clip(part, 18)}" if show_part else "") + OFF)                                            # portrait dash
     hidden = len(out) - height
     if hidden > 0:
         out = out[:height - 1] + [f"{DIM}   … {hidden + 1} more finished jobs in the last 24 h{OFF}"]

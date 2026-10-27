@@ -121,7 +121,7 @@ can no longer be resumed or restored; its spend still counts if the dashboard ha
   per dashboard), and the size of its file.
 - **Spend by month.** In a tall pane, bars in the theme's colour fill the rows down to the clock:
   - one bar per month, with its total above it;
-  - this month is solid up to today and shaded (`░`) up to its pace;
+  - this month is solid up to today and faded up to its pace;
   - a set budget is a red dotted line.
 - A short pane keeps the most important lines. With 7 rows to spare it adds the month bars, and with 9 more the last
   7 days.
