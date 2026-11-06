@@ -26,5 +26,10 @@ CTX_CLEAR_K=400
 NUDGE_MIN=10
 MONTH_BUDGET_USD=
 
+# Days of spend the month's projection ("pace") extrapolates from: pace = month to date + the daily rate of the last
+# PACE_WINDOW_DAYS days x the days left. 0 = the whole-month average instead (a burst raises it at once but idling
+# brings it down only slowly).
+PACE_WINDOW_DAYS=7
+
 # claude-session-index --weekly: folder for "Claude week <YYYY-Www>.md" (empty = print to the terminal).
 WEEKLY_EXPORT_DIR=

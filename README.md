@@ -113,6 +113,10 @@ can no longer be resumed or restored; its spend still counts if the dashboard ha
   line must be set up.
 - **Spend.** What the transcripts would cost at API list prices: this month, its pace, last month, today, the last 7
   days and today's costliest session.
+- **Pace.** Where the month ends if the spending of the last `PACE_WINDOW_DAYS` days (7) carries on: month to date plus
+  that daily rate times the days left, today counted only for the part of it that has gone. So it comes down as soon as
+  you stop, and a whole idle window brings it to the month to date. `PACE_WINDOW_DAYS=0` uses the whole-month average,
+  which a burst raises at once but idling lowers by only 1/days-gone a day.
 - **Budget.** With `MONTH_BUDGET_USD` set, the month shows its share of the budget. The pace turns yellow at 80% of it
   and red at 100%. A tmux message comes once when the month to date passes 80%, and once at 100%.
 - **Warm now.** How many sessions have a warm cache, what one more step of all of them costs, and when the next one
@@ -278,6 +282,7 @@ Settings go in `~/.config/tmux-dashboard/config` as `KEY=VALUE` lines. The templ
 | `CTX_WARN_K`, `CTX_CLEAR_K` | 200, 400 | context, in thousands of tokens, that turns yellow or red |
 | `NUDGE_MIN` | 10 | warm minutes left that trigger the nudge; 0 turns it off |
 | `MONTH_BUDGET_USD` | empty | monthly budget at API prices |
+| `PACE_WINDOW_DAYS` | 7 | days of spend the month's projection extrapolates from; 0 = whole-month average |
 | `SESSION_CODES` | empty | experiment-code prefixes beyond Exp, Gen, Cyt and Seq, spelled as they should appear (`TC,LM`) |
 | `PARK_MODEL` | haiku | the model that writes a parked thread's note; `off` keeps the stub |
 | `WEEKLY_EXPORT_DIR` | empty | where `claude-session-index --weekly` writes `Claude week <YYYY-Www>.md`; empty prints it |

@@ -1003,6 +1003,22 @@ def spend():
     return by
 
 
+def spend_daily():
+    """{"2026-11-06": usd, ...}: the responses spend() counts, by local day, from the spend index alone - no build(),
+    so a panel can have it on every refresh. Responses whose day is unknown ("?", or only the month for transcripts
+    purged before v2) are left out."""
+    with _sp_lock:
+        _spend_files()
+        by = {}
+        for (day, mk), cost in _agg()["g"].items():
+            if len(day) == 10:
+                by[day] = by.get(day, 0) + cost
+        for model, day, t, cost, sids in _best().values():
+            if len(day) == 10:
+                by[day] = by.get(day, 0) + cost
+    return by
+
+
 def spend_index_size():
     """What the spend index costs: {"mem": bytes this process holds for it (the entries, the response table and the
     totals), "file": bytes of SPEND, "live": responses not yet frozen, "frozen": transcripts frozen, "files": all of
@@ -1139,15 +1155,31 @@ def spend_days(rows=None, now=None):
 
 def budget(now=None):
     """Month to date against MONTH_BUDGET_USD (empty = no budget), for the usage panel: {"month": "2026-10", "mtd",
-    "pace" (mtd / days gone x days in the month, at least half a day gone), "budget" (None without one), "fraction"
-    (mtd / budget) and "pace_fraction" (pace / budget), both None without a budget}."""
+    "pace" (what the month ends at if the spending of the last days carries on), "budget" (None without one),
+    "fraction" (mtd / budget) and "pace_fraction" (pace / budget), both None without a budget}.
+
+    pace = mtd + the recent daily rate x the days of the month left. The rate is the spend of the last
+    PACE_WINDOW_DAYS days (7 by default, 0 = the old whole-month average), today counted only for the part of it that
+    has gone, so an idle day lowers the rate instead of leaving it where the last busy day put it, and a whole idle
+    window brings the projection down to the month to date. A month-average pace cannot do that: it divides by every
+    day gone, so stopping moves it by only 1/days-gone a day while a burst raises it at once."""
     now = now or time.time()
     lt = time.localtime(now)
     start = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
     month = time.strftime("%Y-%m", lt)
     mtd = spend().get(month, 0.0)
     ndays = ((date(lt.tm_year + lt.tm_mon // 12, lt.tm_mon % 12 + 1, 1) - date(lt.tm_year, lt.tm_mon, 1)).days)
-    pace = mtd / max((now - start) / 86400, 0.5) * ndays
+    win = setting_num("PACE_WINDOW_DAYS", 7)
+    win = 7 if win is None else max(int(win), 0)
+    if win:
+        today = date.fromtimestamp(now)
+        midnight = time.mktime((today.year, today.month, today.day, 0, 0, 0, 0, 0, -1))
+        daily = spend_daily()
+        recent = sum(daily.get((today - timedelta(days=i)).isoformat(), 0.0) for i in range(win))
+        exposure = win - 1 + min(max((now - midnight) / 86400, 1 / 1440), 1.0)   # today counts for the part gone
+        pace = mtd + recent / exposure * max(ndays - (now - start) / 86400, 0.0)
+    else:
+        pace = mtd / max((now - start) / 86400, 0.5) * ndays
     cap = setting_num("MONTH_BUDGET_USD", None, float)
     cap = cap if cap and cap > 0 else None
     return {"month": month, "mtd": mtd, "pace": pace, "budget": cap, "fraction": mtd / cap if cap else None,

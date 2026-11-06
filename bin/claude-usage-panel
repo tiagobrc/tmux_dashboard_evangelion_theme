@@ -9,8 +9,9 @@ percentage (usage only grows inside a window).
 Spend is what the transcripts would have cost at API list prices (what an Enterprise or API account is billed), every
 response once, subagents included - claude_sessions, counted in a background thread once a minute:
 
-  Oct $1,210 · pace $1,900 · Sep $1,750   month to date, the whole month at this rate, last month; with
-                                          MONTH_BUDGET_USD set also the share of it (pace past 80% yellow, 100% red)
+  Oct $1,210 · pace $1,900 · Sep $1,750   month to date, where the month ends at the rate of the last 7 days
+                                          (PACE_WINDOW_DAYS), last month; with MONTH_BUDGET_USD set also the share
+                                          of it (pace past 80% yellow, 100% red)
   today $120 · 7 days $610 ▆▁▁█▄▄▆        the last 7 days, oldest first
   top today $45 w12 Gen022830 qPCR prim…  today's costliest session
   warm now: 2 sessions, $.27/step         what one more step of every warm session costs

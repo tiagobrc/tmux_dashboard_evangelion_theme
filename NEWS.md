@@ -1,5 +1,16 @@
 # tmux-dashboard news
 
+## 2026-11-06: the month's pace follows the last 7 days
+
+- **Pace.** The projection for the month was `month to date / days gone x days in the month`. Spending raised it at
+  once, but stopping lowered it by only 1/days-gone a day, so it read as a number that only goes up: ten idle days
+  into a $682 month it still claimed $1,301.
+- It is now `month to date + the daily rate of the last PACE_WINDOW_DAYS days (7) x the days left`, with today counted
+  only for the part of it that has gone, so a quiet morning does not fake a collapse in the rate. Stopping now brings
+  it down day by day and a whole idle window lands it on the month to date. `PACE_WINDOW_DAYS=0` restores the average.
+- `claude_sessions.spend_daily()` gives the spend index by day without `build()`, so the panel's cheap refresh - the
+  one it uses while nobody is looking - stays cheap.
+
 ## 2026-10-26: no gap in this month's bar, portrait rows split in half
 
 - **Spend by month.** This month's projection is drawn in a faded accent instead of `░`. With `░` there was a gap: the
